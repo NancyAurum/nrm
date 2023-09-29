@@ -7,7 +7,7 @@ $lbl  SWI OS_WriteS
       SWI OS_NewLine
     MEND
 
-    ; NRM GET and INCLUDE RISC OS path format
+    ; NRM GET and INCLUDE expect RISC OS path format
     ; ../AsmHdrs/h/SWINames.s = ^.AsmHdrs.h.SWINames/s
     GET getswi/s
 

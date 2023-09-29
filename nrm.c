@@ -2225,10 +2225,7 @@ enter_while:
       for (;;) { //FIXME: implement option of C escapes
         int ch = rd();
         if (ch == FLE) fatal("EOF in string");
-        if (ch == '\"') {
-          aput(C.out, 0);
-          break;
-        }
+        if (ch == '\"') break;
         aput(C.out, ch);
       }
     } else if (isdigit(nx)) {
