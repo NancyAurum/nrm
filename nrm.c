@@ -22,6 +22,8 @@ TODO:
 - includes
 - finish implementing expressions, especially <= and >=,
   these need flm_t improvements
+- Macro being able to reference global variables, if local and args fail
+- Local variables, which are limited to macro's scope
 - ROUT and local labels, which are useful for macros
 - handle |labels| and |variables|
 - Consult ObjAsm if S bit should be generated with CMP, CMN, TST and TEQ
@@ -1991,11 +1993,15 @@ static void nrm_do_macro(CTX, char *m, char *l, sym_t *s) {
     aput(vs, v);
     //printf("%s\n", v);
   }
-  if (alen(vs) < alen(as)) fatal("too little arguments to a macro");
+  while (alen(vs) < alen(as)) {
+    aput(vs,"");
+  }
   nrm_skip_line(this);
 
+  int escape = 0;
   for (char *p = body; *p; p++) {
-    if (*p != '$') {
+    if (*p == '|') escape = !escape; //dont expand inside |symbols|
+    if (*p != '$' || escape) {
       aput(r, *p);
       continue;
     }
