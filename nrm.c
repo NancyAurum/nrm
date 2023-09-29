@@ -211,6 +211,8 @@ Coprocessor/SWI instruction format:
 #define alast(a)  arrlast(a)
 #define adup(a)   arrdup(a)
 
+//NOTE: the bellow macro doesn't add trailing 0
+#define aputs(a,b) for(char *p_ = b; *p_; p_++) aput(a,*p_)
 
 
 ////////////////////////// GENERIC DECLARATIONS ////////////////////////////////
@@ -646,7 +648,7 @@ typedef struct {
   val_t v; //value of the symbol
 } sym_t;
 
-typedef struct { char *key; sym_t *value; } *sym_tbl_t;
+typedef struct { char *key; sym_t *value; } *scope_t;
 
 
 #define SYM_TYPE(s) ((s)->desc&0xff)
@@ -1106,7 +1108,8 @@ typedef struct { //represents expression delayed for the 2nd pass
 struct nrm_t { // NRM's state
   flm_t flm;       //file manager
   nrm_opt_t opt;   //user specified options
-  sym_tbl_t st;    //symbol map
+  //scope_t st;    //symbol map
+  scope_t *ss;   //symbol scopes
   sym_t **sl;      //symbol list
   int ifdepth;     //depth of if/else nesting
   int mdepth;      //macro expansion depth
@@ -1336,28 +1339,76 @@ static void flm_init(flm_t *this, TCTX *ctx) {
 
 ////////////////////////////// NRM SYMBOL //////////////////////////////////////
 
+//scope limit
+#define SCP_ALL    0
+#define SCP_GLOBAL 1
+#define SCP_LOCAL  2
 
-static sym_t *nrm_sref(CTX, char *name) {
-  sym_t *s = shget(C.st, name);
-  if (!s) {
-    s = malloc(sizeof(sym_t));
-    s->desc = VAL_NON;
-    s->name = strdup(name);
-    memset(s, 0, sizeof(sym_t));
-    shput(C.st, name, s);
-    aput(C.sl, s);
+static sym_t *nrm_sref_h(CTX, char *name, int limit) {
+  scope_t *ss = C.ss;
+  int start, end;
+  if (!limit) {
+    start = alen(ss)-1;
+    end = 0;
+  } else if (limit == SCP_GLOBAL) {
+    start = 0;
+    end = 0;
+  } else if (limit == SCP_LOCAL) {
+    start = alen(ss)-1;
+    end = 1;
+  } else {
+    start = 0;
+    end = 1;
   }
+  for (int i = start; i >= end; i--) {
+    sym_t *s = shget(ss[i], name);
+    if (s) return s;
+  }
+  sym_t *s = malloc(sizeof(sym_t));
+  memset(s, 0, sizeof(sym_t));
+  s->desc = VAL_NON;
+  s->name = strdup(name);
+  shput(C.ss[start], name, s);
+  aput(C.sl, s);
   return s;
 }
 
+static sym_t *nrm_sref(CTX, char *name) {
+  return nrm_sref_h(this, name, SCP_ALL);
+}
 
 static sym_t *nrm_gbl_ref(CTX, char *name, int desc) {
-  sym_t *s = nrm_sref(this, name);
+  sym_t *s = nrm_sref_h(this, name, SCP_GLOBAL);
   s->desc = desc;
   return s;
 }
 
+static sym_t *nrm_sget_h(CTX, char *name, int limit) {
+  scope_t *ss = C.ss;
+  int start, end;
+  if (!limit) {
+    start = alen(ss)-1;
+    end = 0;
+  } else if (limit == SCP_GLOBAL) {
+    start = 1;
+    end = 0;
+  } else if (limit == SCP_LOCAL) {
+    start = alen(ss)-1;
+    end = 1;
+  } else {
+    start = 0;
+    end = 1;
+  }
+  
+  for (int i = start; i >= end; i--) {
+    sym_t *s = shget(ss[i], name);
+    if (s) return s;
+  }
+  return 0;
+}
 
+
+#define nrm_sget(name) nrm_sget_h(this, (name), SCP_ALL) 
 
 
 ////////////////////////////// NRM INIT ////////////////////////////////////////
@@ -1375,6 +1426,18 @@ void nrm_name_reg(CTX, char *name, int index) {
   s->v.w = index;
 }
 
+void nrm_open_scope(CTX) {
+  aput(C.ss, 0);
+  int last = alen(C.ss)-1;
+  sh_new_arena(C.ss[last]);
+}
+
+void nrm_close_scope(CTX) {
+  scope_t s = apop(C.ss);
+  shfree(s);
+}
+
+
 
 void nrm_init(CTX, nrm_opt_t *opt) {
   if (!nrm_globals_ready) nrm_init_globals();
@@ -1384,7 +1447,7 @@ void nrm_init(CTX, nrm_opt_t *opt) {
   if (opt) memcpy(&C.opt, opt, sizeof(nrm_opt_t));
   else nrm_opt_init(&C.opt);
 
-  sh_new_arena(C.st);
+  nrm_open_scope(this);
   flm_init(&this->flm, this);
 
   for (ki_t *rn = base_regs; rn->key; rn++) {
@@ -1399,6 +1462,7 @@ static nrm_t *new_nrm(nrm_opt_t *opt) {
 }
 
 static void del_nrm(CTX) {
+  nrm_close_scope(this);
   for (int i = 0; i < alen(C.whlstk); i++) arrfree(C.whlstk[i]);
   arrfree(C.whlstk);
   flm_deinit(&this->flm);
@@ -1713,7 +1777,7 @@ arg_retry:
     int shtype;
     char *s;
     RDS(s,issymchr);
-    sym_t *sym = shget(C.st,s);
+    sym_t *sym = nrm_sget(s);
     if (sym) {
       if (sym->desc == VAL_EQU) {
         flm_minclude(&this->flm, "<EQU>", s, strlen(s), 0);
@@ -1965,9 +2029,39 @@ static char *nrm_read_macro(CTX) {
 //ObjAsm set it to 256
 #define NRM_MAX_MACRO_DEPTH 512
 
+//ObjAsm does `$` substition for every readed line.
+//That can be too slow for a JIT compiler, which doesn't need that
+//Defining the below macro only does `$` subtituion inside macro bodies,
+//Single time at the point of macro call.
+#define NRM_CONTINUOUS_SUBST
+
+static char *nrm_do_subst(CTX, LHPI, char *expr) {
+  int escape = 0;
+  char *r = 0;
+  for (char *p = expr; *p; p++) {
+    if (*p == '|') escape = !escape; //dont expand inside |symbols|
+    if (*p != '$' || escape) {
+      aput(r, *p);
+      continue;
+    }
+    p++;
+    char *n = LHPTR;
+    for (; *p && issymchr(*p); p++) LHPUT(*p);
+    p--;
+    LHPUT(0);
+    if (*p == '.') p++; //special char terminating a macro variable reference
+    sym_t *s = nrm_sget(n);
+    if (!s) fatal("reference to undeclared variable `$%s`", n);
+    char *v = s->v.s;
+    while (*v) aput(r,*v++);
+  }
+  aput(r, 0);
+  return r;
+}
+
 static void nrm_do_macro(CTX, char *m, char *l, sym_t *s) {
   LHP(512);
-  char **as, **dvs, *body, *r = 0;
+  char **as, **dvs, *body;
 
   if (++C.mdepth > NRM_MAX_MACRO_DEPTH)
     fatal("macro expansion depth limit reached");
@@ -1982,6 +2076,7 @@ static void nrm_do_macro(CTX, char *m, char *l, sym_t *s) {
 
   SKPWS();
   while (!ISNLC(nx)) { //read argument values
+    //printf("`%c`\n", nx);
     if (alen(vs) >= alen(as)) fatal("too many arguments to a macro");
     char *v;
     if (nx=='\"') v = nrm_read_string(this,LHPA);
@@ -1989,37 +2084,32 @@ static void nrm_do_macro(CTX, char *m, char *l, sym_t *s) {
     SKPWS();
     SKPAD();
     if (!strcmp(v,"|")) v = dvs[alen(vs)];
+    //printf("%d/%d: `%s`\n", alen(vs), alen(as), v);
     aput(vs, v);
-    //printf("%s\n", v);
   }
   while (alen(vs) < alen(as)) {
     aput(vs,"");
   }
   nrm_skip_line(this);
 
-  int escape = 0;
-  for (char *p = body; *p; p++) {
-    if (*p == '|') escape = !escape; //dont expand inside |symbols|
-    if (*p != '$' || escape) {
-      aput(r, *p);
-      continue;
-    }
-    p++;
-    char *n = LHPTR;
-    for (; *p && issymchr(*p); p++) LHPUT(*p);
-    p--;
-    LHPUT(0);
-    if (*p == '.') p++; //special char terminating a macro variable reference
-    int i;
-    for (i = 0; i < alen(as); i++) if (!strcmp(n,as[i])) break;
-    if (i >= alen(as)) fatal("unbound macro variable `$%s`", n);
-    char *v = vs[i];
-    while (*v) aput(r,*v++);
+  nrm_open_scope(this);
+  
+  for (int i = 0; i < alen(as); i++) { //add arguments to the scope
+    sym_t *s = nrm_sref_h(this, as[i], SCP_LOCAL);
+    s->desc = VAL_STRING;
+    s->v.s = strdup(vs[i]);
   }
-  aput(r, 0);
-
   arrfree(vs);
-  flm_minclude(&this->flm, m, r, alen(r), MFL_OWNED|MFL_MACRO);
+
+#ifdef NRM_CONTINUOUS_SUBST
+  char *r = 0;
+  aputs(r, body);
+  aput(r, 0);
+#else
+  char *r = nrm_do_subst(this, LHPA, body);
+#endif
+
+  flm_minclude(&this->flm, m, r, alen(r)-1, MFL_OWNED|MFL_MACRO);
 }
 
 static void nrm_do_dct(CTX, LHPI, char *m, char *l) { //handles directives
@@ -2027,7 +2117,7 @@ static void nrm_do_dct(CTX, LHPI, char *m, char *l) { //handles directives
   sym_t r;
   int dct = shget(dctm, m);
   if (!dct) {
-    sym_t *sym = shget(C.st,m);
+    sym_t *sym = nrm_sget(m);
     if (sym && sym->desc == VAL_MACRO) {
       nrm_do_macro(this, m, l, sym);
       return;
@@ -2087,6 +2177,7 @@ enter_while:
   } else if (dct == NRM_D_MEND) {
     if (!C.mdepth) fatal("unexpected MEND");
     --C.mdepth;
+    nrm_close_scope(this);
   } else if (dct == NRM_D_GET) {
     //GET accepts RISC OS style names:
     SKPWS();
@@ -2188,7 +2279,7 @@ arg_retry:
     int shtype;
     RDS(a->s,issymchr);
     //a->v.s
-    sym_t *sym = shget(C.st, a->s);
+    sym_t *sym = nrm_sget(a->s);
 
     if (sym) {
       if (sym->desc == VAL_REG) {
@@ -2230,6 +2321,7 @@ arg_retry:
           rd();
         }
         if (nx == '&')  {
+          rd();
           base = 16;
         }
         READ_NUM(v,base)
@@ -2237,7 +2329,7 @@ arg_retry:
         a->v.w = (v<<7) | (shtype<<5);
       } else if (isalpha(c)) {
         RDS(a->s,issymchr);
-        sym_t *sym = shget(C.st, a->s);
+        sym_t *sym = nrm_sget(a->s);
         if (!sym || sym->desc != VAL_REG) {
            fatal("`%s` is unexpected", a->s);
         }
@@ -2333,7 +2425,7 @@ read_hex_imm:
       int c = nx;
       if (isalpha(c)) {
         RDS(a->s,issymchr);
-        sym_t *sym = shget(C.st, a->s);
+        sym_t *sym = nrm_sget(a->s);
         if (!sym || sym->desc != VAL_REG) fatal("`%s` is unexpected", a->s);
         if (interp) {
           interp = 0;
@@ -2399,7 +2491,7 @@ static int nrm_parse_args(CTX, LHPI, U32 dsc, args_info_t *ai) {
   return 0;
 }
 
-static void nrm_process_args(CTX, U32 dsc, char *m, args_info_t *ai) {
+static U32 nrm_process_args(CTX, U32 dsc, char *m, args_info_t *ai) {
   nrm_arg_t *as = ai->as;
   int n = ai->n;
 
@@ -2545,15 +2637,26 @@ static void nrm_process_args(CTX, U32 dsc, char *m, args_info_t *ai) {
     fatal("operation `%s` is unimplemented", m);
     break;
   }
+  return dsc;
 }
 
 static void nrm_do_expr(CTX) { //processes single expression
-  LHP(256); //temporary area for parsing mnemonic and args
+  LHP(512); //temporary area for parsing mnemonic and args
   char shd[512]; //shadow copy of this input line
 
   cflp_save();
+
+#ifdef NRM_CONTINUOUS_SUBST
+  char *t;
+  RDS(t,!ISNL);
+  char *r = nrm_do_subst(this, LHPA, t);
+  flm_minclude(&this->flm, "<subst>", r, alen(r)-1, MFL_OWNED);
+  LHP_RESET();
+#endif
+
+
   cflp_shd(shd);
-  
+
   char *l = nrm_read_label(this,LHPA);
   if (ISFLE(nx) && *l) {
     nrm_set_label(this, l, this->pc);
@@ -2582,7 +2685,7 @@ static void nrm_do_expr(CTX) { //processes single expression
   //skip comment till EOL
   if (nx == ';') nrm_skip_comment(this);
 
-  nrm_process_args(this, dsc, m, &ai);
+  dsc = nrm_process_args(this, dsc, m, &ai);
 
   nrm_outw(this, dsc);
 }
