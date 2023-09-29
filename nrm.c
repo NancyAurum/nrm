@@ -19,11 +19,11 @@ GOALS:
 
 
 TODO:
-- includes
-- finish implementing expressions, especially <= and >=,
-  these need flm_t improvements
 - Macro being able to reference global variables, if local and args fail
 - Local variables, which are limited to macro's scope
+- finish implementing expressions, especially <= and >=,
+  these need flm_t improvements
+- `.` and other {VARS}
 - ROUT and local labels, which are useful for macros
 - handle |labels| and |variables|
 - Consult ObjAsm if S bit should be generated with CMP, CMN, TST and TEQ
@@ -979,7 +979,7 @@ enum { NRM_D_FIRST_DRC=0,
   NRM_D_ASSERT,
   NRM_D_OPT, NRM_D_TTL, NRM_D_SUBT,
   NRM_D_ORG, NRM_D_LTORG, NRM_D_AREA, NRM_D_ENTRY, NRM_D_ROUT,
-  NRM_D_END, NRM_D_KEEP, NRM_D_GET, NRM_D_INCLUDE,
+  NRM_D_END, NRM_D_KEEP, NRM_D_GET,
   NRM_D_IMPORT, NRM_D_EXPORT,
   NRM_D_EQU,
   NRM_D_GBLA, NRM_D_GBLL, NRM_D_GBLS,
@@ -1003,7 +1003,7 @@ static ku_t dcts[] = { //assembler directives
   {"LTORG", NRM_D_LTORG},
   {"AREA", NRM_D_AREA}, {"ENTRY", NRM_D_ENTRY}, {"ROUT", NRM_D_ROUT},
   {"END", NRM_D_END},  {"KEEP", NRM_D_KEEP},
-  {"GET", NRM_D_GET}, {"INCLUDE", NRM_D_INCLUDE},
+  {"GET", NRM_D_GET}, {"INCLUDE", NRM_D_GET},
   {"IMPORT", NRM_D_IMPORT}, {"EXPORT", NRM_D_EXPORT},
   {"*", NRM_D_EQU}, {"EQU", NRM_D_EQU},
   {"GBLA", NRM_D_GBLA}, {"GBLL", NRM_D_GBLL}, {"GBLS", NRM_D_GBLS},
@@ -1188,7 +1188,7 @@ static void flm_deinit(flm_t *this) {
 
 
 
-static flp_t *flm_cur_flp(flm_t *this) {
+static flp_t *flm_cur_file(flm_t *this) {
   int nfiles = alen(this->fstack);
   for (int i =  nfiles-1; i >= 0; i--) {
     flp_t *p = this->fstack[i];
@@ -1207,25 +1207,23 @@ static char *flm_resolve(flm_t *this, char *rel_name) {
     nonlocal = 1;
     rel_name++;
   }
-  flp_t *cfp = flm_cur_flp(this);
+  flp_t *cfp = flm_cur_file(this);
   char **ps = this->paths;
-  if (!ps) return 0;
   url_t *url = url_parts(rel_name);
   if (!*url->ext) {
     tmprel_name = cat(rel_name, ".h");
     rel_name = tmprel_name;
   }
   free(url);
-  for (int i = -1; i < 0 || *ps; i++) {
+  for (int i = -1; i < alen(ps); i++) {
     char *folder;
-    if (i == -1) {
+    if (i == -1) { //this we try current folder
       if (nonlocal || !cfp) {
         continue;
       }
       folder = cfp->fl->url->dir; //try current dir
     } else {
-      folder = *ps;
-      ps++;
+      folder = ps[i];
     }
     tmpname = cat(folder, rel_name);
     if (C.ctx->opt.exists(this,tmpname)) break;
@@ -1313,9 +1311,9 @@ static void flm_include(flm_t *this, char *rel_name) {
     flm_push(this, f);
     return;
   }
-  
+
   f = mfl_open(C.ctx, filename);
-  if (!f) fatalF(C.ctx, "Couldn't read `%s`", filename);
+  if (!f) fatalF(C.ctx, "couldn't read `%s`", filename);
 
   f->flm = this;
 
@@ -1412,14 +1410,15 @@ void nrm_cstr(CTX, char *cstr) {
   flm_minclude(&this->flm, "<cstr>", cstr, strlen(cstr), 0);
 }
 
+void nrm_include(CTX, char *filename) {
+  flm_include(&C.flm, filename);
+}
 
 
-////////////////////////// NRM OPERATIONS //////////////////////////////////////
 
 
-typedef struct { //parsed instruction
-  U32 dsc; //binary description of the instruction
-} nrm_nst_t;
+///////////////////////////// NRM PARSER ///////////////////////////////////////
+
 
 
 //is is newline (file end is treated as an implicit newline)
@@ -1963,7 +1962,7 @@ static char *nrm_read_macro(CTX) {
   s->v.v = v;
 }
 
-//ought to be enough for everyone
+//ObjAsm set it to 256
 #define NRM_MAX_MACRO_DEPTH 512
 
 static void nrm_do_macro(CTX, char *m, char *l, sym_t *s) {
@@ -2033,6 +2032,10 @@ static void nrm_do_dct(CTX, LHPI, char *m, char *l) { //handles directives
       nrm_do_macro(this, m, l, sym);
       return;
     } else {
+      if (!*m) {
+        nrm_skip_line(this);
+        return; //empty line
+      }
       fatal("unknown operation `%s`", m);
     }
   }
@@ -2084,6 +2087,23 @@ enter_while:
   } else if (dct == NRM_D_MEND) {
     if (!C.mdepth) fatal("unexpected MEND");
     --C.mdepth;
+  } else if (dct == NRM_D_GET) {
+    //GET accepts RISC OS style names:
+    SKPWS();
+    char *t;
+    RDS(t, !ISNL);
+    char *path = LHPTR;
+    for (; *t; *t++) { //translate path from RISC OS to Unix
+      int c = *t;
+      if (c == '.') LHPUT('/');
+      else if (c == '/') LHPUT('.');
+      else if (c == '^') {LHPUT('.'); LHPUT('.');}
+      else LHPUT(c);
+    }
+    nrm_skip_line(this);
+    LHPUT(0);
+    nrm_include(this, path);
+    return;
   } else if (dct == NRM_D_GBLA) {
     if (!isalpha(nx)) fatal("Unexpected `c`", nx);
     RDS(name,issymchr);
@@ -2599,10 +2619,6 @@ static uint8_t *nrm_do(CTX) { //process entire S file
   arrfree(C.out);
   C.out = 0;
   return r;
-}
-
-void nrm_include(CTX, char *filename) {
-  flm_include(&C.flm, filename);
 }
 
 
