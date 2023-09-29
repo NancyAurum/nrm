@@ -19,9 +19,9 @@ GOALS:
 
 
 TODO:
-- WHILE/WEND
-- macros (start with swinames)
-- expressions
+- includes
+- finish implementing expressions, especially <= and >=,
+  these need flm_t improvements
 - ROUT and local labels, which are useful for macros
 - handle |labels| and |variables|
 - Consult ObjAsm if S bit should be generated with CMP, CMN, TST and TEQ
@@ -320,6 +320,11 @@ typedef struct {
 #define LHPI lhp__t *lhp_
 #define LHPA lhp_
 
+#define LHPTR lhp_->p
+
+#define LHPUT(v) do {if (lhp_->p == lhp_->e) fatal("line is too long."); \
+                     *lhp_->p++ = (v); } while (0)
+
 //read characters by calling rd(), while tst(nx) is true
 //assumes hp points to a temporary heap buffer and he points to its end
 #define RDS(dst,tst) do {                              \
@@ -597,7 +602,7 @@ static int rdF(flp_t *f) {
 #define VAL_REG      0x01
 
 //macro
-#define VAL_MCR      0x02
+#define VAL_MACRO    0x02
 
 //macro constant
 #define VAL_EQU      0x04
@@ -630,6 +635,7 @@ typedef union { //note that ARM word is 32bit, compared to x86's 16bit
   S32 sd; //dword
   S64 sq; //qword
   char *s;
+  void *v;
 } val_t;
 
 typedef struct {
@@ -1101,6 +1107,7 @@ struct nrm_t { // NRM's state
   sym_tbl_t st;    //symbol map
   sym_t **sl;      //symbol list
   int ifdepth;     //depth of if/else nesting
+  int mdepth;      //macro expansion depth
   char **whlstk;   //stack of nested whiles
   U8 *sshd;        //saved shadow buffer pointer
   int pass;        //assembler's pass
@@ -1344,6 +1351,13 @@ static sym_t *nrm_sref(CTX, char *name) {
 }
 
 
+static sym_t *nrm_gbl_ref(CTX, char *name, int desc) {
+  sym_t *s = nrm_sref(this, name);
+  s->desc = desc;
+  return s;
+}
+
+
 
 
 ////////////////////////////// NRM INIT ////////////////////////////////////////
@@ -1406,15 +1420,18 @@ typedef struct { //parsed instruction
 } nrm_nst_t;
 
 
-//is end of stream, line feed or comment
-
+//is is newline (file end is treated as an implicit newline)
 #define ISNL(x) (ISFLE(x) || (x)=='\n')
+
+//is new line or comment
 #define ISNLC(x) (ISNL(x) || (x)==';')
 
-//is argument end
+//whitespace/new-line/comment
 #define ISWSNLC(x) (ISNLC(x) || ISWS(x))
-#define ISAE(x) (ISWSNLC(x) || (x) == ',')
-#define SKPAE(p) do { if (nx == ',') {rd(); SKPWS();} } while(0)
+
+//argument delimiter
+#define ISAD(x) (ISWSNLC(x) || (x) == ',')
+#define SKPAD() do { if (nx == ',') {rd(); SKPWS();} } while(0)
 
 
 
@@ -1673,6 +1690,12 @@ read_nl:
   return l;
 }
 
+static char *nrm_read_mnemonic(CTX,LHPI) {
+  char *m;
+  RDS(m,!ISWSNLC);
+  SKPWS();
+  return m;
+}
 
 
 static void nrm_read_num(CTX, LHPI, int base, sym_t *r) {
@@ -1842,8 +1865,6 @@ static char *nrm_read_body(CTX, char *open, char *term) {
   int nest = 0; //counts nested `[` and `]`
   char *r = 0;
   SHD_OFF();
-  
-  int i = 0;
 
 again:
   if (nx == FLE) fatal("missing %s for %s", term, open);
@@ -1875,17 +1896,140 @@ again:
   return r;
 }
 
-static sym_t *nrm_gbl_ref(CTX, char *name, int desc) {
-  sym_t *s = nrm_sref(this, name);
-  s->desc = desc;
-  return s;
+static char *nrm_read_string(CTX, LHPI) {
+  char *r = LHPTR;
+  rd(); //eat `"`
+  for (;;) {
+    int c = rd();
+    if (c == '\"') {
+      if (nx != '\"') break;
+      rd();
+    } else if (ISFLE(c)) fatal("EOF in string");
+    LHPUT(c);
+  }
+  LHPUT(0);
+  return r;
+}
+
+#define ISADEQ(x) (ISAD(x) || (x)=='=')
+static char *nrm_read_macro(CTX) {
+  LHP(256);
+  char *l = nrm_read_label(this,LHPA);
+  char *m = nrm_read_mnemonic(this,LHPA);
+
+  if (*l == '$') ++l;
+
+  char **as = 0; //argument names
+  char **vs = 0; //default values
+  aput(as, strdup(l));
+  aput(vs, strdup(""));
+
+  SKPWS();
+  while (!ISNLC(nx)) {
+    char *a;
+    char *v = "";
+    RDS(a,!ISADEQ);
+    if (*a == '$') ++a;
+    SKPWS();
+    if (nx=='=') {
+      rd();
+      SKPWS();
+      if (nx=='\"') v = nrm_read_string(this,LHPA);
+      else RDS(v,!ISAD);
+      SKPWS();
+    }
+    SKPAD();
+    aput(as, strdup(a));
+    aput(vs, strdup(v));
+  }
+  nrm_skip_line(this);
+
+  char *body = nrm_read_body(this, "MACRO", "MEND");
+
+#if 0
+  printf("macro %s\n", m);
+  for (int i = 0; i < alen(as); i++) printf("arg%d: %s=%s\n", i, as[i], vs[i]);
+  printf("%s", body);
+#endif
+
+  void **v = 0;
+  aput(v,as);
+  aput(v,vs);
+  aput(v,body);
+  sym_t *s = nrm_sref(this, m);
+  s->desc = VAL_MACRO;
+  s->v.v = v;
+}
+
+//ought to be enough for everyone
+#define NRM_MAX_MACRO_DEPTH 512
+
+static void nrm_do_macro(CTX, char *m, char *l, sym_t *s) {
+  LHP(512);
+  char **as, **dvs, *body, *r = 0;
+
+  if (++C.mdepth > NRM_MAX_MACRO_DEPTH)
+    fatal("macro expansion depth limit reached");
+  
+  void **mv = s->v.v;
+  as = mv[0];
+  dvs = mv[1]; //default values
+  body = mv[2];
+  char **vs = 0;
+
+  aput(vs, l);
+
+  SKPWS();
+  while (!ISNLC(nx)) { //read argument values
+    if (alen(vs) >= alen(as)) fatal("too many arguments to a macro");
+    char *v;
+    if (nx=='\"') v = nrm_read_string(this,LHPA);
+    else RDS(v,!ISAD);
+    SKPWS();
+    SKPAD();
+    if (!strcmp(v,"|")) v = dvs[alen(vs)];
+    aput(vs, v);
+    //printf("%s\n", v);
+  }
+  if (alen(vs) < alen(as)) fatal("too little arguments to a macro");
+  nrm_skip_line(this);
+
+  for (char *p = body; *p; p++) {
+    if (*p != '$') {
+      aput(r, *p);
+      continue;
+    }
+    p++;
+    char *n = LHPTR;
+    for (; *p && issymchr(*p); p++) LHPUT(*p);
+    p--;
+    LHPUT(0);
+    if (*p == '.') p++; //special char terminating a macro variable reference
+    int i;
+    for (i = 0; i < alen(as); i++) if (!strcmp(n,as[i])) break;
+    if (i >= alen(as)) fatal("unbound macro variable `$%s`", n);
+    char *v = vs[i];
+    while (*v) aput(r,*v++);
+  }
+  aput(r, 0);
+
+  arrfree(vs);
+  flm_minclude(&this->flm, m, r, alen(r), MFL_OWNED|MFL_MACRO);
 }
 
 static void nrm_do_dct(CTX, LHPI, char *m, char *l) { //handles directives
   char *name;
   sym_t r;
   int dct = shget(dctm, m);
-  if (!dct) fatal("unknown operation `%s`", m);
+  if (!dct) {
+    sym_t *sym = shget(C.st,m);
+    if (sym && sym->desc == VAL_MACRO) {
+      nrm_do_macro(this, m, l, sym);
+      return;
+    } else {
+      fatal("unknown operation `%s`", m);
+    }
+  }
   if (dct == NRM_D_EQU) { //these are akin to argless C99 macros
     if (!*l) fatal("EQU without a label.");
     char *v;
@@ -1927,6 +2071,13 @@ enter_while:
       arrfree(body); //can't do it before flm_conclude
       apop(C.whlstk);
     }
+  } else if (dct == NRM_D_MACRO) {
+    nrm_skip_line(this);
+    nrm_read_macro(this);
+    return;
+  } else if (dct == NRM_D_MEND) {
+    if (!C.mdepth) fatal("unexpected MEND");
+    --C.mdepth;
   } else if (dct == NRM_D_GBLA) {
     if (!isalpha(nx)) fatal("Unexpected `c`", nx);
     RDS(name,issymchr);
@@ -2196,7 +2347,7 @@ read_hex_imm:
     fatal("operand %d is invalid", n);
   }
   SKPWS();
-  SKPAE();
+  SKPAD();
   ai->n = ++n;
   return 0;
 }
@@ -2383,9 +2534,7 @@ static void nrm_do_expr(CTX) { //processes single expression
     return;
   }
 
-  char *m;
-  RDS(m,!ISWSNLC);
-  SKPWS();
+  char *m = nrm_read_mnemonic(this,LHPA);
   
   //fprintf(stderr, "%s\n", m);
 
@@ -2417,6 +2566,7 @@ static uint8_t *nrm_do(CTX) { //process entire S file
   C.pass = 0;
   C.out = 0;
   C.ifdepth = 0;
+  C.mdepth = 0;
   while (!ISFLE(nx)) {
     this->pc = alen(this->out);
     nrm_do_expr(this);
