@@ -19,7 +19,6 @@ GOALS:
 
 
 TODO:
-- conditional [|] IF/THEN/ELSE/ENDIF
 - WHILE/WEND
 - macros (start with swinames)
 - expressions
@@ -212,7 +211,7 @@ Coprocessor/SWI instruction format:
 
 
 
-////////////////////////// GENERIC DECLARATION /////////////////////////////////
+////////////////////////// GENERIC DECLARATIONS ////////////////////////////////
 
 #define U8  uint8_t
 #define U16 uint16_t
@@ -304,22 +303,45 @@ static char *_hidden_cat_(char *a0, ...) {
 ////////////////////////// MEMORY MANAGEMENT ///////////////////////////////////
 
 
+///////////////////////////
 //local heap, allows evading malloc where possible
-#define LHP(TSZ) char h_[TSZ]; char *hp_=h_, *he_ = h_+TSZ-1
+typedef struct {
+  char *p;
+  char *e;
+} lhp__t;
+
+#define LHP_RESET() do {lhp_->p = lhpd_;} while (0)
+
+#define LHP(TSZ)                     \
+  char lhpd_[TSZ]; lhp__t lhpb_;     \
+  lhp__t *lhp_ = &lhpb_;             \
+  lhp_->p = lhpd_;                   \
+  lhp_->e = lhpd_ + TSZ;
+#define LHPI lhp__t *lhp_
+#define LHPA lhp_
 
 //read characters by calling rd(), while tst(nx) is true
 //assumes hp points to a temporary heap buffer and he points to its end
 #define RDS(dst,tst) do {                              \
+    char *hp_ = lhp_->p;                               \
+    char *he_ = lhp_->e;                               \
     dst = hp_;                                         \
     while (tst(nx)) {                                  \
+      if (nx == FLE)  fatal("unexpected EOF");         \
       if (hp_ == he_) fatal("line is too long.");      \
       *hp_++ = rd();                                   \
     }                                                  \
     *hp_++ = 0;                                        \
+    lhp_->p = hp_;                                     \
   } while (0)
 
 
-
+#define SKP(tst) do {                                  \
+    while (tst(nx)) {                                  \
+      if (nx == FLE) fatal("unexpected EOF");          \
+      rd();                                            \
+    }                                                  \
+  } while (0)
 
 
 
@@ -569,22 +591,24 @@ static int rdF(flp_t *f) {
 // SYMBOL TYPES
 
 //none
-#define SYM_NON  0x00
-
-//mnemonic
-#define SYM_MNM  0x01
-
-//macro
-#define SYM_MCR  0x02
+#define VAL_NON      0x00
 
 //register
-#define SYM_REG  0x03
+#define VAL_REG      0x01
+
+//macro
+#define VAL_MCR      0x02
 
 //macro constant
-#define SYM_EQU  0x04
+#define VAL_EQU      0x04
 
 //macro constant
-#define SYM_LBL  0x05
+#define VAL_LBL      0x05
+
+#define VAL_LOGIC    0x06
+#define VAL_ARITH    0x07
+#define VAL_STRING   0x08
+
 
 //ObjAsm apparently uses AREA as a synonym for namespace
 typedef struct {
@@ -753,8 +777,7 @@ typedef struct { char *key; sym_t *value; } *sym_tbl_t;
 //software interrupt
 #define NRM_SWI  ((0x7<<25)|(1<<24))
 
-
-
+#define NRM_MAX_SWI_INDEX 0xFFFFFF
 
 
 //for S suffixed opcodes
@@ -1077,6 +1100,9 @@ struct nrm_t { // NRM's state
   nrm_opt_t opt;   //user specified options
   sym_tbl_t st;    //symbol map
   sym_t **sl;      //symbol list
+  int ifdepth;     //depth of if/else nesting
+  char **whlstk;   //stack of nested whiles
+  U8 *sshd;        //saved shadow buffer pointer
   int pass;        //assembler's pass
   U8 *out;         //where output is currently being written
   dld_t *dld;      //list of delayed expressions
@@ -1137,7 +1163,7 @@ static void flm_deinit(flm_t *this) {
     fp->fl = 0;
     del_flp(fp);
   }
-  arrfree(this->fstack);
+  //arrfree(this->fstack);
 
   for (int i = 0; i < shlen(this->ft); i++) {
     mfl_t *next = this->ft[i].value;
@@ -1308,7 +1334,7 @@ static sym_t *nrm_sref(CTX, char *name) {
   sym_t *s = shget(C.st, name);
   if (!s) {
     s = malloc(sizeof(sym_t));
-    s->desc = SYM_NON;
+    s->desc = VAL_NON;
     s->name = strdup(name);
     memset(s, 0, sizeof(sym_t));
     shput(C.st, name, s);
@@ -1331,7 +1357,7 @@ void nrm_opt_init(nrm_opt_t *o) {
 //assign's name to a register indexed by index
 void nrm_name_reg(CTX, char *name, int index) {
   sym_t *s = nrm_sref(this,name);
-  s->desc = SYM_REG;
+  s->desc = VAL_REG;
   s->v.w = index;
 }
 
@@ -1359,6 +1385,8 @@ static nrm_t *new_nrm(nrm_opt_t *opt) {
 }
 
 static void del_nrm(CTX) {
+  for (int i = 0; i < alen(C.whlstk); i++) arrfree(C.whlstk[i]);
+  arrfree(C.whlstk);
   flm_deinit(&this->flm);
   free(this);
 }
@@ -1480,7 +1508,7 @@ static U32 parse_stldm_type(U32 dsc, char *m) {
 
 #define MAX_MM_LEN 7
 
-static U32 parse_mnemonic(CTX, char *mm) {
+static U32 nrm_parse_mnemonic(CTX, char *mm) {
   U32 dsc;
   char m[8], t[8];
 
@@ -1597,14 +1625,14 @@ void nrm_skip_comment(CTX) {
   if (nx == '\n') rd();
 }
 
-void nrm_skip_till_eol(CTX) {
+void nrm_skip_line(CTX) {
   while (!ISNL(nx)) rd();
   if (nx == '\n') rd();
 }
 
 static void nrm_set_label(CTX, char *l, U32 pc) {
   sym_t *s = nrm_sref(this,l);
-  s->desc = SYM_LBL;
+  s->desc = VAL_LBL;
   s->v.w = pc;
 }
 
@@ -1618,22 +1646,14 @@ static void nrm_outw(CTX, U32 w) {
   C.out = out;
 }
 
-static void nrm_do_expr(CTX) { //processes single expression
-  LHP(256); //temporary area for parsing mnemonic and args
-  char shd[512]; //shadow copy of this input line
-  char *m, *l;
-  nrm_arg_t as[5];
-  int n = 0; //nargs
-  
-  cflp_save();
-  cflp_shd(shd);
 
-read_label:
-
+static char *nrm_read_label(CTX,LHPI) {
+  char *l;
   //ObjAsm labels variables always begin at the start of a line,
   //everything else gets indented.
+read_label:
   if (ISWS(nx)) {
-    l = "";
+    l =  "";
     SKPWS();
   } else if (nx == ';') {
     nrm_skip_comment(this);
@@ -1641,303 +1661,572 @@ read_label:
   } else { 
     RDS(l,!ISWSNLC); SKPWS();
   }
-
-read_mnemonic:
+read_nl:
   if (nx == '\n') {
     rd();
     if (*l) {
       SKPWS();
-      goto read_mnemonic;
+      goto read_nl;
     }
     goto read_label;
   }
+  return l;
+}
+
+
+
+static void nrm_read_num(CTX, LHPI, int base, sym_t *r) {
+  READ_NUM(v,base);
+  r->desc = VAL_ARITH;
+  r->v.w = v;
+}
+
+static int nrm_eval_term(CTX, LHPI, sym_t *r) {
+  int c;
+arg_retry:
+  c = nx;
+  if (isalpha(c)) {
+    int shtype;
+    char *s;
+    RDS(s,issymchr);
+    sym_t *sym = shget(C.st,s);
+    if (sym) {
+      if (sym->desc == VAL_EQU) {
+        flm_minclude(&this->flm, "<EQU>", s, strlen(s), 0);
+        goto arg_retry;
+      } else if (sym->desc == VAL_LBL || sym->desc == VAL_ARITH) {
+        r->desc = VAL_ARITH;
+        r->v.w = sym->v.w;
+      } else if (sym->desc == VAL_LOGIC) {
+        r->desc = VAL_LOGIC;
+        r->v.w = sym->v.w;
+      } else if (sym->desc == VAL_STRING) {
+        r->desc = VAL_STRING;
+        r->v.s = sym->v.s;
+      } else {
+        fatal("`%s` is unexpected", s);
+      }
+    } else { //should we allow multipass resolution here?
+#if 0
+      if (C.pass == 0) {
+        dld_t dld;
+        FLLOC(row,col,name,cflp_saved());
+        dld.row = row; dld.col = col; dld.name = strdup(name);
+        dld.pc = alen(C.out);
+        nrm_skip_line(this); //ignored for now
+        *cflp->shd = 0;
+        cflp->shd = 0;
+        dld.expr = strdup(ai->shd);
+        aput(C.dld,dld);
+        nrm_outw(this, 0);
+        return -1;
+      }
+      else
+#endif
+      {
+        fatal("symbol `%s` is undefined", s);
+      }
+    }
+  } else if (c == '#') {
+    rd();
+    SKPWS();
+    if (nx == '&') goto read_hex_num;
+
+    if (nx == '\"') {
+      char *s;
+      int tc = rd();
+      RDS(s,!ISTC);
+      rd();
+      if (strlen(s)>1) fatal("char literal #\"%s\" is too big", s);
+      r->desc = VAL_ARITH;
+      r->v.w = s[0]; //assume ASCII
+      return 0;
+    }
+read_num:
+    nrm_read_num(this, LHPA, 10, r);
+  } else if (isdigit(c)) {
+    goto read_num;
+  } else if (c == '&') {
+read_hex_num:
+    rd();
+    nrm_read_num(this, LHPA, 16, r);
+  } else if (c == '{') {
+    char *s;
+    int tc = '}';
+    rd();
+    RDS(s,!ISTC);
+    rd();
+    if (!strcmp(s,"TRUE")) {
+      r->desc = VAL_LOGIC;
+      r->v.w = 1;
+    } else if (!strcmp(s,"FALSE")) {
+      r->desc = VAL_LOGIC;
+      r->v.w = 0;
+    } else {
+      fatal("builtin variable {%s} is unknown", s);
+    }
+  } else {
+    fatal("unexpected `%c`", c);
+  }
+  return 0;
+}
+
+static void nrm_eval_add(CTX, LHPI, sym_t *r) {
+  nrm_eval_term(this, LHPA, r);
+again:
+  SKPWS();
+  if (nx == '+' || nx == '-') {
+    int op = rd();
+    SKPWS();
+    sym_t t;
+    nrm_eval_term(this, LHPA, &t);
+    if (op == '+') r->v.w += t.v.w;
+    else r->v.w -= t.v.w;
+    r->desc = VAL_ARITH;
+    goto again;
+  }
+}
+
+static void nrm_eval_cmp(CTX, LHPI, sym_t *r) {
+  nrm_eval_add(this, LHPA, r);
+again:
+  SKPWS();
+  if (nx == '<' || nx == '>' || nx == '=') { //FIXME:  `>=` requires unrd(ch)
+    int op = rd();
+    SKPWS();
+    sym_t t;
+    nrm_eval_add(this, LHPA, &t);
+    if (op == '<') r->v.w = r->v.w < t.v.w;
+    else if (op == '>') r->v.w = r->v.w > t.v.w;
+    else r->v.w = r->v.w == t.v.w;
+    r->desc = VAL_LOGIC;
+    goto again;
+  }
+}
+
+static void nrm_eval(CTX, sym_t *r) {
+  LHP(256);
+  nrm_eval_cmp(this, LHPA, r);
+}
+
+
+#define SHD_OFF() do { C.sshd = cflp->shd; cflp_shd(0); } while (0)
+#define SHD_ON() do {  cflp_shd(C.sshd); } while (0)
+
+static int nrm_skip_ifelse(CTX) {
+  int nest = 0; //counts nested `[` and `]`
+  SHD_OFF();
+again:
+  nrm_skip_line(this);
+  rd();
+  if (ISWS(nx)) SKPWS();
+  else {
+    SKP(!ISWS);
+    SKPWS();
+  }
+  if (nx != '|' && nx != ']') {
+    if (nx == '[') ++nest;
+    goto again;
+  }
+  if (nest) {
+    if (nx == ']') --nest;
+    goto again;
+  }
+  SHD_ON();
+  return rd();
+}
+
+static char *nrm_read_body(CTX, char *open, char *term) {
+  LHP(256);
+  char *m;
+  int nest = 0; //counts nested `[` and `]`
+  char *r = 0;
+  SHD_OFF();
   
-  if (ISFLE(nx)) {
-    if (*l) nrm_set_label(this, l, alen(C.out));
+  int i = 0;
+
+again:
+  if (nx == FLE) fatal("missing %s for %s", term, open);
+  while (!ISNL(nx)) aput(r, rd());
+  //printf("<<<DEBUG%d:%p %s\n", i, r, cflp->ptr);
+  if (ISWS(nx)) while (ISWS(nx)) aput(r, rd());
+  else {
+    while (!ISWS(nx) && nx != FLE) aput(r, rd());
+    if (ISWS(nx)) while (ISWS(nx)) aput(r, rd());
+  }
+  //printf(">>>DEBUG%d:%p %s\n", ++i, r, cflp->ptr);
+  RDS(m,!ISWSNLC);
+  char *p = m;
+  for (; *p; p++) aput(r, *p);
+  upcase(m,m);
+  if (strcmp(m, term)) {
+    if (open && !strcmp(m, open)) nest++;
+    LHP_RESET();
+    goto again;
+  }
+  if (nest) {
+    LHP_RESET();
+    goto again;
+  }
+  SHD_ON();
+  while (!ISNL(nx)) aput(r, rd());
+  while (nx == '\n') aput(r, rd());
+  aput(r, 0);
+  return r;
+}
+
+static sym_t *nrm_gbl_ref(CTX, char *name, int desc) {
+  sym_t *s = nrm_sref(this, name);
+  s->desc = desc;
+  return s;
+}
+
+static void nrm_do_dct(CTX, LHPI, char *m, char *l) { //handles directives
+  char *name;
+  sym_t r;
+  int dct = shget(dctm, m);
+  if (!dct) fatal("unknown operation `%s`", m);
+  if (dct == NRM_D_EQU) { //these are akin to argless C99 macros
+    if (!*l) fatal("EQU without a label.");
+    char *v;
+    RDS(v,!ISNLC);
+    if (nx == '\n') rd();
+    sym_t *s = nrm_sref(this,l);
+    s->desc = VAL_EQU;
+    s->v.s = strdup(v);
+    *l = 0; //consume label
     return;
   }
-
-  RDS(m,!ISWSNLC); SKPWS();
   
-  //fprintf(stderr, "%s\n", m);
-
-  U32 dsc = parse_mnemonic(this, m);
-  //U32 dsc = shget(opctbl, m);
-  if (dsc == NRM_BAD_OPCODE) {
-    int dct = shget(dctm, m);
-    U32 pc = alen(C.out);
-    if (!dct) fatal("unknown operation `%s`", m);
-    if (dct == NRM_D_EQU) { //these are akin to argless C99 macros
-      if (!*l) fatal("EQU without a label.");
-      char *v;
-      RDS(v,!ISNLC);
-      if (nx == '\n') rd();
-      sym_t *s = nrm_sref(this,l);
-      s->desc = SYM_EQU;
-      s->v.s = strdup(v);
-      *l = 0; //consume label
-    } else if (dct == NRM_D_AREA) {
-      nrm_skip_till_eol(this); //ignored for now
-    } else if (dct == NRM_D_ENTRY) {
-      nrm_skip_till_eol(this); //for now we assume 1st opcode to be entry
-    } else if (dct == NRM_D_DCB) {
-      if (nx == '\"') {
-        rd();
-        for (;;) { //FIXME: implement option of C escapes
-          int ch = rd();
-          if (ch == FLE) fatal("EOF in string");
-          if (ch == '\"') {
-            aput(C.out, 0);
-            break;
-          }
-          aput(C.out, ch);
-        }
-      } else if (isdigit(nx)) {
-        READ_NUM(v,10);
-        if ((U32)v > 255) fatal("DCB value is invalid");
-        aput(C.out, v);
-      } else {
-        fatal("DCB value is invalid");
-      }
-    } else if (dct == NRM_D_DCD) {
-      if (nx == '&') {
-        rd();
-        READ_NUM(v,16);
-        nrm_outw(this, v);
-        nrm_skip_till_eol(this);
-      } else {
-        fatal("DCD value is invalid");
-      }
-    } else if (dct == NRM_D_ALIGN) { //FIXME: implement optional arguments
-      while (alen(C.out)&0x3) aput(C.out, 0);
-    } else if (dct == NRM_D_END) {
-      nrm_skip_till_eol(this);
-    } else{
-      fatal("directive `%s` is unimplemented", m);
+  if (dct == NRM_D_IF) {
+    nrm_eval(this, &r);
+    if (r.desc != VAL_ARITH && r.desc != VAL_LOGIC)
+      fatal("string value in conditional");
+    if (r.v.w) ++this->ifdepth;
+    else if (nrm_skip_ifelse(this) == '|') ++this->ifdepth;
+  } else if (dct == NRM_D_ELSE) {
+    if (!this->ifdepth || nrm_skip_ifelse(this) == '|')
+      fatal("unexpected `%s`", "|");
+    --this->ifdepth;
+  } else if (dct == NRM_D_ENDIF) {
+    if (!this->ifdepth) fatal("unexpected `%s`", "]");
+    --this->ifdepth;
+  } else if (dct == NRM_D_WHILE) {
+    aput(C.whlstk, nrm_read_body(this, "WHILE", "WEND"));
+    goto enter_while;
+  } else if (dct == NRM_D_WEND) {
+    if (!alen(C.whlstk)) fatal("unexpected WEND");
+    while (!ISNL(nx)) rd();
+    nrm_skip_line(this);
+enter_while:
+    char *body = alast(C.whlstk);
+    flm_minclude(&C.flm, "<WHILE>", body, strlen(body), 0);
+    nrm_eval(this, &r);
+    if (!r.v.w) {
+      flm_conclude(&C.flm);
+      arrfree(body); //can't do it before flm_conclude
+      apop(C.whlstk);
     }
-    if (*l) nrm_set_label(this, l, pc);
-    return; //it is possible we got END
-  }
-
-  if (*l) nrm_set_label(this, l, alen(C.out));
-
-  U32 cls = NRM_CLS(dsc);
-
-  //fprintf(stderr, "%x\n", dsc);
-
-  int bo = 0; //opening bracket
-  int bd = 0; //bracket depth
-  int bs = -1; //bracket start
-  int be = -1; //bracket end
-  int wb = 0; //write-back
-  int nr = 0; //negative register
-  for (; !ISNLC(nx) && n < 5; n++) {
-    int c;
-    cflp_save(); //save file position for error reporting
-    nrm_arg_t *a = &as[n];
-arg_retry:
-    c = nx;
-    if (isalpha(c)) {
-      int shtype;
-      RDS(a->s,issymchr);
-      //a->v.s
-      sym_t *sym = shget(C.st, a->s);
-
-      if (sym) {
-        if (sym->desc == SYM_REG) {
-          a->desc = NRM_ARG_REG;
-          a->v.w = sym->v.w;
-        } else if (sym->desc == SYM_EQU) {
-          flm_minclude(&this->flm, "<EQU>", sym->v.s, strlen(sym->v.s), 0);
-          goto arg_retry;
-        } else if (sym->desc == SYM_LBL) {
-          a->desc = NRM_ARG_IMM;
-          U32 v = sym->v.w;
-          if (cls != NRM_CLS_DPR && cls != NRM_CLS_DPI) {
-            if (cls == NRM_CLS_STLDI) bo = '[';
-            a->v.sw = v;
-          } else {
-            a->v.w = nrm_enc_imm(v);
-            if (a->v.w == NRM_BAD_IMM) fatal("can't encode `%d`", v);
-          }
-        } else {
-          fatal("`%s` is unexpected", a->s);
-        }
-      } else if ((shtype = shget(sftm, a->s)) != NRM_S_NIL) {
-        int base = 10;
-        char s[4];
-        strncpy(s, a->s, 3);
-        s[3] = 0;
-        upcase(s,s);
-
-        a->desc = NRM_ARG_SFT;
-
-        SKPWS();
-        if (shtype == NRM_S_RRX) {
-          a->v.w = 0;
-        } else if (nx == '#' || nx == '&' || ISWS(nx)) {
-          if (nx == '#')  {
-            rd();
-          }
-          if (nx == '&')  {
-            base = 16;
-          }
-          READ_NUM(v,base)
-          if (v > 31) fatal("shift value `%d` is larger than 31", v);
-          a->v.w = (v<<7) | (shtype<<5);
-        } else if (isalpha(c)) {
-          RDS(a->s,issymchr);
-          sym_t *sym = shget(C.st, a->s);
-          if (!sym || sym->desc != SYM_REG) {
-             fatal("`%s` is unexpected", a->s);
-          }
-          a->v.w = (sym->v.w<<8)|NRM_SFT_REG;
-        } else {
-          fatal("operand %d is invalid", n);
-        }
-      } else {
-        if (C.pass == 0) {
-          dld_t dld;
-          FLLOC(row,col,name,cflp_saved());
-          dld.row = row; dld.col = col; dld.name = strdup(name);
-          dld.pc = alen(C.out);
-          nrm_skip_till_eol(this); //ignored for now
-          *cflp->shd = 0;
-          cflp->shd = 0;
-          dld.expr = strdup(shd);
-          aput(C.dld,dld);
-          aput(C.out,0); aput(C.out,0); aput(C.out,0); aput(C.out,0);
-          return;
-        } else {
-          fatal("symbol `%s` is undefined", a->s);
-        }
-      }
-    } else if (c == '#') {
-      int base = 10;
+  } else if (dct == NRM_D_GBLA) {
+    if (!isalpha(nx)) fatal("Unexpected `c`", nx);
+    RDS(name,issymchr);
+    nrm_gbl_ref(this, name, VAL_ARITH)->v.w = 0;
+  } else if (dct == NRM_D_GBLL) {
+    if (!isalpha(nx)) fatal("Unexpected `c`", nx);
+    RDS(name,issymchr);
+    nrm_gbl_ref(this, name, VAL_LOGIC)->v.w = 0;
+  } else if (dct == NRM_D_GBLS) {
+    if (!isalpha(nx)) fatal("Unexpected `c`", nx);
+    RDS(name,issymchr);
+    nrm_gbl_ref(this, name, VAL_STRING)->v.s = strdup("");
+  } else if (dct == NRM_D_SETA) {
+    nrm_eval(this, &r);
+    nrm_gbl_ref(this, l, VAL_ARITH)->v.w = r.v.w;
+    *l = 0;
+  } else if (dct == NRM_D_SETL) {
+    fatal("SETL");
+  } else if (dct == NRM_D_SETS) {
+    fatal("SETS");
+  } else if (dct == NRM_D_AREA) {
+    //ignored for now
+  } else if (dct == NRM_D_ENTRY) {
+    //for now we assume 1st opcode to be entry
+  } else if (dct == NRM_D_DCB) {
+    if (nx == '\"') {
       rd();
-      SKPWS();
-      if (nx == '\"') {
-        int tc = rd();
-        RDS(a->s,!ISTC);
-        rd();
-        if (strlen(a->s)>1)
-          fatal("char literal #\"%s\" is too big", a->s);
-        a->v.w = a->s[0]; //assume ASCII
-      } else {
-        if (nx == '&') {
-read_hex_imm:
-          base = 16;
-          rd();
+      for (;;) { //FIXME: implement option of C escapes
+        int ch = rd();
+        if (ch == FLE) fatal("EOF in string");
+        if (ch == '\"') {
+          aput(C.out, 0);
+          break;
         }
+        aput(C.out, ch);
+      }
+    } else if (isdigit(nx)) {
+      READ_NUM(v,10);
+      if ((U32)v > 255) fatal("DCB value is invalid");
+      aput(C.out, v);
+    } else {
+      fatal("DCB value is invalid");
+    }
+  } else if (dct == NRM_D_DCD) {
+    if (nx == '&') {
+      rd();
+      READ_NUM(v,16);
+      nrm_outw(this, v);
+    } else {
+      fatal("DCD value is invalid");
+    }
+  } else if (dct == NRM_D_ALIGN) { //FIXME: implement optional arguments
+    while (alen(C.out)&0x3) aput(C.out, 0);
+  } else if (dct == NRM_D_END) {
+  } else{
+    fatal("directive `%s` is unimplemented", m);
+  }
+  nrm_skip_line(this);
+}
+
+#define NRM_MAX_ARGS 5
+typedef struct {
+  int n;  //argument number
+  nrm_arg_t as[NRM_MAX_ARGS]; //arguments
+  int bd; //bracket depth
+  int bs; //bracket start
+  int be; //bracket end
+  int wb; //write-back
+  int nr; //negative register
+  char *shd;
+} args_info_t;
+
+
+static int nrm_parse_arg(CTX, LHPI, U32 dsc, args_info_t *ai) {
+  U32 cls = NRM_CLS(dsc);
+  int c;
+  int n = ai->n;
+  nrm_arg_t *a = &ai->as[n];
+arg_retry:
+  c = nx;
+  if (isalpha(c)) {
+    int shtype;
+    RDS(a->s,issymchr);
+    //a->v.s
+    sym_t *sym = shget(C.st, a->s);
+
+    if (sym) {
+      if (sym->desc == VAL_REG) {
+        a->desc = NRM_ARG_REG;
+        a->v.w = sym->v.w;
+      } else if (sym->desc == VAL_EQU) {
+        flm_minclude(&this->flm, "<EQU>", sym->v.s, strlen(sym->v.s), 0);
+        goto arg_retry;
+      } else if (sym->desc == VAL_LBL) {
         a->desc = NRM_ARG_IMM;
-        READ_NUM(v,base);
+        U32 v = sym->v.w;
         if (cls != NRM_CLS_DPR && cls != NRM_CLS_DPI) {
-          if (cls == NRM_CLS_STLDI) bo = '[';
+          if (cls == NRM_CLS_STLDI) {
+            ai->bs = n;
+            ai->be = n+1;
+          }
           a->v.sw = v;
         } else {
           a->v.w = nrm_enc_imm(v);
           if (a->v.w == NRM_BAD_IMM) fatal("can't encode `%d`", v);
         }
+      } else {
+        fatal("`%s` is unexpected", a->s);
       }
-      
-    } else if (c == '&') {
-      goto read_hex_imm;
-    } else if (c == '=') {
-      fatal("implement `=` reading.");
-    } else if (c == '|') {
-      fatal("implement `|` reading.");
-    } else if (c == '[') {
-      if (bo) fatal("unexpected `%c`", c);
-      rd();
-      bo = c;
-      bd++;
-      bs = n;
-      n--;
-    } else if (c == ']') {
-      rd();
-      if (bo!='[') fatal("unexpected `%c`",c);
-      be = n;
-      bd--;
-      n--;
-    } else if (c == '-') {
-      if (cls != NRM_CLS_STLDI) fatal("unexpected `%c`",c);
-      rd();
-      nr = n;
-      n--;
-    } else if (c == '!') {
-      if (cls != NRM_CLS_STLDI && cls != NRM_CLS_STLDM)
-        fatal("unexpected `%c`",c);
-      rd();
-      wb = n;
-      n--;
-    } else if (c == '{') {
-      if (cls != NRM_CLS_STLDM) fatal("unexpected `%c`",c);
-      rd();
-      U32 regs = 0;
-      int prev = -1;
-      int interp = 0;
+    } else if ((shtype = shget(sftm, a->s)) != NRM_S_NIL) {
+      int base = 10;
+      char s[4];
+      strncpy(s, a->s, 3);
+      s[3] = 0;
+      upcase(s,s);
+
+      a->desc = NRM_ARG_SFT;
+
       SKPWS();
-      for (;;) {
-        int c = nx;
-        if (isalpha(c)) {
-          RDS(a->s,issymchr);
-          sym_t *sym = shget(C.st, a->s);
-          if (!sym || sym->desc != SYM_REG) fatal("`%s` is unexpected", a->s);
-          if (interp) {
-            interp = 0;
-            int a = prev;
-            int b = sym->v.w;
-            if (a > b) {
-              int t = b;
-              b = a-1;
-              a = t-1;
-            }
-            while (a++ < b) regs |= 1<<a;
-            prev = sym->v.w;
-          } else {
-            prev = sym->v.w;
-            regs |= 1<<prev;
-          }
-        } else if (c == '-') {
+      if (shtype == NRM_S_RRX) {
+        a->v.w = 0;
+      } else if (nx == '#' || nx == '&' || ISWS(nx)) {
+        if (nx == '#')  {
           rd();
-          interp = 1;
-        } else if (c == ',') {
-          rd();
-        } else if (c == '}') {
-          rd();
-          break;
-        } else {
-          fatal("unexpected `%c`",c);
         }
+        if (nx == '&')  {
+          base = 16;
+        }
+        READ_NUM(v,base)
+        if (v > 31) fatal("shift value `%d` is larger than 31", v);
+        a->v.w = (v<<7) | (shtype<<5);
+      } else if (isalpha(c)) {
+        RDS(a->s,issymchr);
+        sym_t *sym = shget(C.st, a->s);
+        if (!sym || sym->desc != VAL_REG) {
+           fatal("`%s` is unexpected", a->s);
+        }
+        a->v.w = (sym->v.w<<8)|NRM_SFT_REG;
+      } else {
+        fatal("operand %d is invalid", n);
       }
-      SKPWS();
-      if (nx == '^') {
-        rd();
-        regs |= NRM_LOAD_PSR_FORCE_USER_MODE;
-      }
-      as[n].desc = NRM_ARG_RES;
-      as[n].v.w = regs;
     } else {
-      fatal("operand %d is invalid", n);
+      if (C.pass == 0) {
+        dld_t dld;
+        FLLOC(row,col,name,cflp_saved());
+        dld.row = row; dld.col = col; dld.name = strdup(name);
+        dld.pc = alen(C.out);
+        nrm_skip_line(this); //ignored for now
+        *cflp->shd = 0;
+        cflp->shd = 0;
+        dld.expr = strdup(ai->shd);
+        aput(C.dld,dld);
+        nrm_outw(this, 0);
+        return -1;
+      } else {
+        fatal("symbol `%s` is undefined", a->s);
+      }
+    }
+  } else if (c == '#') {
+    int base = 10;
+    rd();
+    SKPWS();
+    if (nx == '\"') {
+      int tc = rd();
+      RDS(a->s,!ISTC);
+      rd();
+      if (strlen(a->s)>1)
+        fatal("char literal #\"%s\" is too big", a->s);
+      a->v.w = a->s[0]; //assume ASCII
+    } else {
+      if (nx == '&') {
+read_hex_imm:
+        base = 16;
+        rd();
+      }
+      a->desc = NRM_ARG_IMM;
+      READ_NUM(v,base);
+      if (cls != NRM_CLS_DPR && cls != NRM_CLS_DPI) {
+        if (cls == NRM_CLS_STLDI) {
+          ai->bs = n;
+          ai->be = n+1;
+        }
+        a->v.sw = v;
+      } else {
+        a->v.w = nrm_enc_imm(v);
+        if (a->v.w == NRM_BAD_IMM) fatal("can't encode `%d`", v);
+      }
+    }
+    
+  } else if (c == '&') {
+    goto read_hex_imm;
+  } else if (c == '=') {
+    fatal("implement `=` reading.");
+  } else if (c == '|') {
+    fatal("implement `|` reading.");
+  } else if (c == '[') {
+    if (ai->bs != -1) fatal("unexpected `%c`", c);
+    rd();
+    ai->bd++;
+    ai->bs = n;
+    n--;
+  } else if (c == ']') {
+    rd();
+    if (!ai->bd) fatal("unexpected `%c`",c);
+    ai->be = n;
+    ai->bd--;
+    n--;
+  } else if (c == '-') {
+    if (cls != NRM_CLS_STLDI) fatal("unexpected `%c`",c);
+    rd();
+    ai->nr = n;
+    n--;
+  } else if (c == '!') {
+    if (cls != NRM_CLS_STLDI && cls != NRM_CLS_STLDM)
+      fatal("unexpected `%c`",c);
+    rd();
+    ai->wb = n;
+    n--;
+  } else if (c == '{') {
+    if (cls != NRM_CLS_STLDM) fatal("unexpected `%c`",c);
+    rd();
+    U32 regs = 0;
+    int prev = -1;
+    int interp = 0;
+    SKPWS();
+    for (;;) {
+      int c = nx;
+      if (isalpha(c)) {
+        RDS(a->s,issymchr);
+        sym_t *sym = shget(C.st, a->s);
+        if (!sym || sym->desc != VAL_REG) fatal("`%s` is unexpected", a->s);
+        if (interp) {
+          interp = 0;
+          int a = prev;
+          int b = sym->v.w;
+          if (a > b) {
+            int t = b;
+            b = a-1;
+            a = t-1;
+          }
+          while (a++ < b) regs |= 1<<a;
+          prev = sym->v.w;
+        } else {
+          prev = sym->v.w;
+          regs |= 1<<prev;
+        }
+      } else if (c == '-') {
+        rd();
+        interp = 1;
+      } else if (c == ',') {
+        rd();
+      } else if (c == '}') {
+        rd();
+        break;
+      } else {
+        fatal("unexpected `%c`",c);
+      }
     }
     SKPWS();
-    SKPAE();
+    if (nx == '^') {
+      rd();
+      regs |= NRM_LOAD_PSR_FORCE_USER_MODE;
+    }
+    a->desc = NRM_ARG_RES;
+    a->v.w = regs;
+  } else {
+    fatal("operand %d is invalid", n);
   }
-  if (n > 4) fatal("too many operands"); //too many args
+  SKPWS();
+  SKPAE();
+  ai->n = ++n;
+  return 0;
+}
 
-  if (bo) {
-    if (bd) fatal("unclosed `%c`", bo);
-    int bn = be-bs;
-    if (n == 0 || (bn > 1 && be != n)) fatal("invalid `%c` specification", bo);
+static int nrm_parse_args(CTX, LHPI, U32 dsc, args_info_t *ai) {
+  ai->n = 0; //nargs
+  ai->bd =  0;
+  ai->bs = -1;
+  ai->be = -1;
+  ai->wb =  0;
+  ai->nr =  0;
+  while (!ISNLC(nx)) {
+    if (ai->n >= NRM_MAX_ARGS) fatal("too many operands");
+    cflp_save(); //save file position for error reporting
+    if (nrm_parse_arg(this, LHPA, dsc, ai)) return -1;
   }
+  if (ai->bs != -1) {
+    if (ai->bd) fatal("unclosed `[`");
+    int bn = ai->be - ai->bs;
+    if (ai->n == 0 || (bn > 1 && ai->be != ai->n))
+      fatal("invalid `[...]` specification");
+  }
+  return 0;
+}
 
+static void nrm_process_args(CTX, U32 dsc, char *m, args_info_t *ai) {
+  nrm_arg_t *as = ai->as;
+  int n = ai->n;
 
-
-  //skip comment till EOL
-  if (nx == ';') nrm_skip_comment(this);
-
-  //printf("l=%s m=%s a=%s b=%s c=%s d=%s\n", l, m,a,b,c,d);
-
+  U32 cls = NRM_CLS(dsc);
   switch (cls) {
   case NRM_CLS_DPR: case NRM_CLS_DPI:
     //should we allow partially encoded opcodes
@@ -1982,7 +2271,7 @@ read_hex_imm:
   case NRM_CLS_STLDI: //NRM_CLS_STLDR can't occur before this switch
     if (n < 2) fatal("too little operands");
     if (n > 4) fatal("too many operands");
-    if (wb && (wb != n || n == 2)) fatal("unexpected `%c`",'!');
+    if (ai->wb && (ai->wb != n || n == 2)) fatal("unexpected `%c`",'!');
     if (as[0].desc != NRM_ARG_REG) fatal("operand 0 is invalid");
     int trans = 0;
     if (dsc&0x1) {
@@ -1991,7 +2280,7 @@ read_hex_imm:
     }
     dsc |= as[0].v.w<<12;
     
-    if (bo != '[')  fatal("missing [...] base");
+    if (ai->bs == -1)  fatal("missing [...] base");
     if (as[1].desc == NRM_ARG_REG) {
       dsc |= as[1].v.w<<16; //base register
     } else if (as[1].desc == NRM_ARG_IMM) {
@@ -2018,16 +2307,16 @@ read_hex_imm:
       } else if (as[2].desc == NRM_ARG_REG) {
         dsc |= (NRM_CLS_STLDR<<25);
         dsc |= as[2].v.w;
-        if (nr && nr == 2) nr = 0;
+        if (ai->nr && ai->nr == 2) ai->nr = 0;
         else dsc |= NRM_UP;
       } else {
         fatal("offset is invalid");
       }
 
-      if (wb) dsc |= NRM_WRITEBACK;
-      if (be == n) if (!trans) dsc |= NRM_PRE;
+      if (ai->wb) dsc |= NRM_WRITEBACK;
+      if (ai->be == n) if (!trans) dsc |= NRM_PRE;
       else {
-        if (wb && wb != be) fatal("unexpected `%c`",'!');
+        if (ai->wb && ai->wb != ai->be) fatal("unexpected `%c`",'!');
       }
 
       if (n > 3) {
@@ -2039,14 +2328,14 @@ read_hex_imm:
       }
     }
 
-    if (nr) fatal("unexpected `%c`",'-'); //placed somewhere randomly
+    if (ai->nr) fatal("unexpected `%c`",'-'); //placed somewhere randomly
     break;
 
 
   case NRM_CLS_STLDM:
     if (n != 2) fatal("too %s operands", n > 2 ? "many" : "little");
-    if (wb) {
-      if (wb != 1) fatal("unexpected `%c`",'!');
+    if (ai->wb) {
+      if (ai->wb != 1) fatal("unexpected `%c`",'!');
       dsc |= NRM_WRITEBACK;
     }
 
@@ -2070,9 +2359,8 @@ read_hex_imm:
   case NRM_CLS_SWI:
     if (n != 1) fatal("too %s operands", n > 1 ? "many" : "little");
     if (as[0].desc != NRM_ARG_IMM) fatal("immediate expected");
-#define MAX_SWI_INDEX 0xFFFFFF
-    if (as[0].v.w > MAX_SWI_INDEX)
-      fatal("SWI number is larger than %d", MAX_SWI_INDEX);
+    if (as[0].v.w > NRM_MAX_SWI_INDEX)
+      fatal("SWI number is larger than %d", NRM_MAX_SWI_INDEX);
     dsc |= as[0].v.w;
     break;
 
@@ -2080,20 +2368,63 @@ read_hex_imm:
     fatal("operation `%s` is unimplemented", m);
     break;
   }
+}
 
-do_output:
+static void nrm_do_expr(CTX) { //processes single expression
+  LHP(256); //temporary area for parsing mnemonic and args
+  char shd[512]; //shadow copy of this input line
+
+  cflp_save();
+  cflp_shd(shd);
+  
+  char *l = nrm_read_label(this,LHPA);
+  if (ISFLE(nx) && *l) {
+    nrm_set_label(this, l, this->pc);
+    return;
+  }
+
+  char *m;
+  RDS(m,!ISWSNLC);
+  SKPWS();
+  
+  //fprintf(stderr, "%s\n", m);
+
+  U32 dsc = nrm_parse_mnemonic(this, m);
+  if (dsc == NRM_BAD_OPCODE) {
+    nrm_do_dct(this, LHPA, m, l);
+    if (*l) nrm_set_label(this, l, this->pc);
+    return;
+  }
+
+  if (*l) nrm_set_label(this, l, this->pc);
+
+  //fprintf(stderr, "%x\n", dsc);
+
+  args_info_t ai;
+  ai.shd = shd;
+  if (nrm_parse_args(this, LHPA, dsc, &ai)) return; //cant compile it right now
+
+  //skip comment till EOL
+  if (nx == ';') nrm_skip_comment(this);
+
+  nrm_process_args(this, dsc, m, &ai);
+
   nrm_outw(this, dsc);
 }
 
 
-static uint8_t *nrm_do(CTX) {
+static uint8_t *nrm_do(CTX) { //process entire S file
   C.pass = 0;
   C.out = 0;
+  C.ifdepth = 0;
   while (!ISFLE(nx)) {
     this->pc = alen(this->out);
     nrm_do_expr(this);
     if (nx == '\n') rd();
   }
+
+  if (this->ifdepth) fatal("unclosed `[` if/else/endif");
+
   U8 *r = C.out;
   C.out = 0;
 
