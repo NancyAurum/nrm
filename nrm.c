@@ -1145,6 +1145,7 @@ struct nrm_t { // NRM's state
   int pass;        //assembler's pass
   U8 *out;         //where output is currently being written
   dld_t *dld;      //list of delayed expressions
+  U32 org;         //origin for the currently compiled code
   U32 pc;          //have to maintain a separate one
                    //because out could be broken into parts
   int dldi;
@@ -1369,6 +1370,96 @@ static void flm_init(flm_t *this, TCTX *ctx) {
   sh_new_arena(this->ft); //copies keys to internal store
   this->paths = ctx->opt.paths;
   flm_minclude(this, "", "", 0, MFL_ROOT);
+}
+
+
+/////////////////////////////// AIF SUPPORT ////////////////////////////////////
+
+
+#if 0
+//the below struct is for reference header only
+//dont cast/memcpy it as is, since we want this code
+//to work on big endian machines
+typedef struct {
+/*00*/U32 bl_decompress; //NOP if the image is not compressed.
+/*04*/U32 bl_relocate;   //NOP if the image is not self-relocating.
+/*08*/U32 bl_init;       //NOP if the image has none.
+/*0C*/U32 entry;         //either BL to entry or an offset for non executables
+                         //Non-executable AIF uses an offset, not BL
+/*10*/U32 swi_os_exit;   //...last ditch in case of return.
+/*14*/U32 ro_sz;         //Includes header size if executable AIF;
+                         //excludes headser size if non-executable AIF.
+/*18*/U32 rw_sz;         //Exact size - a multiple of 4 bytes
+/*1C*/U32 debug_sz;      //Exact size - a multiple of 4 bytes
+/*20*/U32 zero_sz;       //`.bss` section size, cleared by bl_init
+                         //a multiple of 4 bytes
+/*24*/U32 debug_type;    //0, 1, 2, or 3
+/*28*/U32 base;          //Address the image (code) was linked at. 
+                         //typically 0x8000
+/*2C*/U32 workspace;     //Min work space - in bytes - to be reserved
+                         //preallocates heap
+/*30*/U32 mode;          //Address mode: 26/32 + 3 flag bytes
+                         //LS byte contains 26 or 32;
+                         //bit 8 set when using a separate data base.
+/*34*/U32 data_base;     //Address the image data was linked at.
+/*38*/U32 reserved0;     //set to 0
+/*3C*/U32 reserved1;     //set to 0
+/*40*/U32 bl_debug_init; //NOP if unused.
+/*44*/U32 init[15];      //init code; typically zeroes zero_sz bytes of bss 
+} aifhdr_t;
+#endif
+
+
+#define AIF_ORG    0x8000
+#define AIF_RO_SZ  0x14
+#define AIF_HDR_SZ 0x80
+//basic header which just transfers control to the code below it
+static uint8_t nrm_aif_header[AIF_HDR_SZ] = {
+  0x00, 0x00, 0xA0, 0xE1,
+  0x00, 0x00, 0xA0, 0xE1,
+  0x00, 0x00, 0xA0, 0xE1,
+  0x1B, 0x00, 0x00, 0xEB,
+  0x11, 0x00, 0x00, 0xEF,
+  0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00,
+  0x00, 0x80, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00,
+  0x1A, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0xA0, 0xE1,
+  0x0F, 0xC0, 0x4E, 0xE0,
+  0x0C, 0xC0, 0x8F, 0xE0,
+  0x0F, 0x00, 0x9C, 0xE9,
+  0x10, 0xC0, 0x4C, 0xE2,
+  0x30, 0x20, 0x9C, 0xE5,
+  0x01, 0x0C, 0x12, 0xE3,
+  0x34, 0xC0, 0x9C, 0x15,
+  0x00, 0xC0, 0x8C, 0x00,
+  0x01, 0xC0, 0x8C, 0xE0,
+  0x00, 0x00, 0xA0, 0xE3,
+  0x00, 0x00, 0x53, 0xE3,
+  0x0E, 0xF0, 0xA0, 0xD1,
+  0x04, 0x00, 0x8C, 0xE4,
+  0x04, 0x30, 0x53, 0xE2,
+  0xFB, 0xFF, 0xFF, 0xEA
+};
+
+
+static int nrm_dump_aif(char *filename, uint8_t *r, uint32_t len) {
+  uint8_t h[AIF_HDR_SZ];
+  memcpy(h, nrm_aif_header, AIF_HDR_SZ);
+  PUTW(h+AIF_RO_SZ,len+AIF_HDR_SZ);
+  FILE *f = fopen(filename, "wb");
+  if (!f) return -1;
+  fwrite(h, 1, AIF_HDR_SZ, f);  
+  fwrite(r, 1, len, f);
+  fclose(f);
+  return 0;
 }
 
 
@@ -1877,7 +1968,7 @@ read_hex_num:
     rd();
 term_pc:
     r->desc = VAL_ARITH;
-    r->v.w = C.pc;
+    r->v.w = C.pc + C.org;
   } else if (c == '{') {
     char *s;
     int tc = '}';
@@ -2732,6 +2823,7 @@ static uint8_t *nrm_do(CTX) { //process entire S file
   C.out = 0;
   C.ifdepth = 0;
   C.mdepth = 0;
+  C.org = AIF_ORG + AIF_HDR_SZ;
   while (!ISFLE(nx)) {
     this->pc = alen(this->out);
     nrm_do_expr(this);
@@ -2914,96 +3006,6 @@ void usage() {
   exit(0);
 }
 
-
-
-
-
-#if 0
-//the below struct is for reference header only
-//dont cast/memcpy it as is, since we want this code
-//to work on big endian machines
-typedef struct {
-/*00*/U32 bl_decompress; //NOP if the image is not compressed.
-/*04*/U32 bl_relocate;   //NOP if the image is not self-relocating.
-/*08*/U32 bl_init;       //NOP if the image has none.
-/*0C*/U32 entry;         //either BL to entry or an offset for non executables
-                         //Non-executable AIF uses an offset, not BL
-/*10*/U32 swi_os_exit;   //...last ditch in case of return.
-/*14*/U32 ro_sz;         //Includes header size if executable AIF;
-                         //excludes headser size if non-executable AIF.
-/*18*/U32 rw_sz;         //Exact size - a multiple of 4 bytes
-/*1C*/U32 debug_sz;      //Exact size - a multiple of 4 bytes
-/*20*/U32 zero_sz;       //`.bss` section size, cleared by bl_init
-                         //a multiple of 4 bytes
-/*24*/U32 debug_type;    //0, 1, 2, or 3
-/*28*/U32 base;          //Address the image (code) was linked at. 
-                         //typically 0x8000
-/*2C*/U32 workspace;     //Min work space - in bytes - to be reserved
-                         //preallocates heap
-/*30*/U32 mode;          //Address mode: 26/32 + 3 flag bytes
-                         //LS byte contains 26 or 32;
-                         //bit 8 set when using a separate data base.
-/*34*/U32 data_base;     //Address the image data was linked at.
-/*38*/U32 reserved0;     //set to 0
-/*3C*/U32 reserved1;     //set to 0
-/*40*/U32 bl_debug_init; //NOP if unused.
-/*44*/U32 init[15];      //init code; typically zeroes zero_sz bytes of bss 
-} aifhdr_t;
-#endif
-
-
-
-#define AIF_RO_SZ  0x14
-
-#define AIF_HDR_SZ 0x80
-//basic header which just transfers control to the code below it
-static uint8_t nrm_aif_header[AIF_HDR_SZ] = {
-  0x00, 0x00, 0xA0, 0xE1,
-  0x00, 0x00, 0xA0, 0xE1,
-  0x00, 0x00, 0xA0, 0xE1,
-  0x1B, 0x00, 0x00, 0xEB,
-  0x11, 0x00, 0x00, 0xEF,
-  0x00, 0x00, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00,
-  0x00, 0x80, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00,
-  0x1A, 0x00, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00,
-  0x00, 0x00, 0xA0, 0xE1,
-  0x0F, 0xC0, 0x4E, 0xE0,
-  0x0C, 0xC0, 0x8F, 0xE0,
-  0x0F, 0x00, 0x9C, 0xE9,
-  0x10, 0xC0, 0x4C, 0xE2,
-  0x30, 0x20, 0x9C, 0xE5,
-  0x01, 0x0C, 0x12, 0xE3,
-  0x34, 0xC0, 0x9C, 0x15,
-  0x00, 0xC0, 0x8C, 0x00,
-  0x01, 0xC0, 0x8C, 0xE0,
-  0x00, 0x00, 0xA0, 0xE3,
-  0x00, 0x00, 0x53, 0xE3,
-  0x0E, 0xF0, 0xA0, 0xD1,
-  0x04, 0x00, 0x8C, 0xE4,
-  0x04, 0x30, 0x53, 0xE2,
-  0xFB, 0xFF, 0xFF, 0xEA
-};
-
-
-int nrm_dump_aif(char *filename, uint8_t *r, uint32_t len) {
-  uint8_t h[AIF_HDR_SZ];
-  memcpy(h, nrm_aif_header, AIF_HDR_SZ);
-  PUTW(h+AIF_RO_SZ,len+AIF_HDR_SZ);
-  FILE *f = fopen(filename, "wb");
-  if (!f) return -1;
-  fwrite(h, 1, AIF_HDR_SZ, f);  
-  fwrite(r, 1, len, f);
-  fclose(f);
-  return 0;
-}
 
 static void b2c(uint8_t *p, int n) {
   int i;
