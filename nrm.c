@@ -511,13 +511,14 @@ static void flm_conclude(flm_t *this);
 static int flp_next(flp_t *f) { return f->ptr==f->end ? FLE : *f->ptr; }
 
 static int flp_read(flp_t *f) {
-  if (f->ptr == f->end) return FLE;
   int ch = f->val;
   if (f->shd) *f->shd++ = ch; //does a shadow copy
-  if (++f->ptr == f->end) flm_conclude(f->file->flm);
-  else {
+  if (++f->ptr < f->end) {
     if (ch == '\n') { f->row++; f->line = f->ptr; }
     f->val = *f->ptr;
+  } else { //file end
+    if (f->ptr-1 != f->end) flm_conclude(f->file->flm);
+    else --f->ptr;
   }
   return ch;
 }
@@ -2200,7 +2201,6 @@ static void nrm_do_macro(CTX, char *m, char *l, sym_t *s) {
 
   SKPWS();
   while (!ISNLC(nx)) { //read argument values
-    //printf("`%c`\n", nx);
     if (alen(vs) >= alen(as)) fatal("too many arguments to a macro");
     char *v;
     if (nx=='\"') v = nrm_read_string(this,LHPA);
@@ -2208,7 +2208,6 @@ static void nrm_do_macro(CTX, char *m, char *l, sym_t *s) {
     SKPWS();
     SKPAD();
     if (!strcmp(v,"|")) v = dvs[alen(vs)];
-    //printf("%d/%d: `%s`\n", alen(vs), alen(as), v);
     aput(vs, v);
   }
   while (alen(vs) < alen(as)) {
