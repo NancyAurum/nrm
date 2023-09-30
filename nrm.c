@@ -246,8 +246,9 @@ Coprocessor/SWI instruction format:
   } while (0)
 
 
-struct nrm_t;
-typedef struct nrm_t nrm_t;
+#define INTRODUCE(type) struct type; typedef struct type type;
+
+INTRODUCE(nrm_t) 
 
 
 #define TCTX nrm_t
@@ -456,17 +457,11 @@ RATIONALE:
 #define MFL_ROOT     0x010
 
 
-struct flm_t;
-typedef struct flm_t flm_t;
+INTRODUCE(flm_t)
+INTRODUCE(flp_t)
+INTRODUCE(mfl_t)
+INTRODUCE(flmp_t)
 
-struct flp_t;
-typedef struct flp_t flp_t;
-
-struct mfl_t;
-typedef struct mfl_t mfl_t;
-
-struct flmp_t;
-typedef struct flmp_t flmp_t;
 
 struct mfl_t { //memory held file
   U32 desc;     //file description
@@ -515,6 +510,8 @@ static void del_mfl(mfl_t *f) {
 
 
 static void flm_location(flm_t *this, flmp_t *p);
+static void flm_minclude(flm_t *this, char *name, U8 *base
+                        ,U32 size, U32 flags);
 static void flm_conclude(flm_t *this);
 
 static int flp_next(flp_t *f) { return f->ptr==f->end ? FLE : *f->ptr; }
@@ -529,6 +526,19 @@ static int flp_read(flp_t *f) {
     f->val = *f->ptr;
   }
   return ch;
+}
+
+static int flp_nextI(flp_t *f, int i) {
+  if (f->ptr+i < f->end) return f->ptr[i];
+  U8 *r = 0;
+  int j;
+  for (j = i; j > 0; j--) {
+    int v = flp_read(f);
+    if (v == FLE) break;
+    aput(r, v);
+  }
+  if (j != i) flm_minclude(f->file->flm, "<peek>", r, alen(r), MFL_OWNED);
+  return j ? FLE : f->ptr[i];
 }
 
 static flp_t *new_flp(mfl_t *f) {
@@ -581,6 +591,9 @@ struct flmp_t {
 
 //next value peek
 #define nx cflp->val
+
+//next ith value fix
+#define ith(i) flp_nextI(cflp, i) 
 
 //read char
 #define rd() flp_read(cflp)
