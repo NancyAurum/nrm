@@ -19,7 +19,6 @@ GOALS:
 
 
 TODO:
-- `.` and other {VARS}
 - ROUT and local labels, which are useful for macros
 - handle |labels| and |variables|
 - Consult ObjAsm if S bit should be generated with CMP, CMN, TST and TEQ
@@ -29,6 +28,7 @@ TODO:
 - replace `strtol` with proper readers
 - consult ObjAsm on if label without anything else on a line should
   be passed to a macro or EQU style directives
+- rest of the {VARS}
 
 NOTES:
 - With 2-pass assembler there are two approaches:
@@ -179,11 +179,6 @@ Coprocessor/SWI instruction format:
 //ObjAsm set it to 256
 #define NRM_MAX_MACRO_DEPTH 512
 
-//ObjAsm does `$` substition for every readed line.
-//That can be too slow for a JIT compiler, which doesn't need that
-//Defining the below macro only does `$` subtituion inside macro bodies,
-//Single time at the point of macro call.
-#define NRM_CONTINUOUS_SUBST
 
 
 //////////////////////////// STANDARD INCLUDES /////////////////////////////////
@@ -2165,27 +2160,26 @@ static char *nrm_read_macro(CTX) {
   s->v.v = v;
 }
 
-static char *nrm_do_subst(CTX, LHPI, char *expr) {
+static char *nrm_read_subst_line(CTX, LHPI) {
   int escape = 0;
-  char *r = 0;
-  for (char *p = expr; *p; p++) {
-    if (*p == '|') escape = !escape; //dont expand inside |symbols|
-    if (*p != '$' || escape) {
-      aput(r, *p);
+  char *r = LHPTR;
+  while (!ISNL(nx)) {
+    int c = rd();
+    if (c == '|') escape = !escape; //dont expand inside |symbols|
+    if (c != '$' || escape) {
+      LHPUT(c);
       continue;
     }
-    p++;
     char *n = LHPTR;
-    for (; *p && issymchr(*p); p++) LHPUT(*p);
-    p--;
-    LHPUT(0);
-    if (*p == '.') p++; //special char terminating a macro variable reference
+    RDS(n, issymchr);
+    if (nx == '.') rd(); //special char terminating a macro variable reference
     sym_t *s = nrm_sget(n);
     if (!s) fatal("reference to undeclared variable `$%s`", n);
     char *v = s->v.s;
-    while (*v) aput(r,*v++);
+    LHPTR = n;
+    while (*v) LHPUT(*v++);
   }
-  aput(r, 0);
+  LHPUT(0);
   return r;
 }
 
@@ -2231,15 +2225,7 @@ static void nrm_do_macro(CTX, char *m, char *l, sym_t *s) {
   }
   arrfree(vs);
 
-#ifdef NRM_CONTINUOUS_SUBST
-  char *r = 0;
-  aputs(r, body);
-  aput(r, 0);
-#else
-  char *r = nrm_do_subst(this, LHPA, body);
-#endif
-
-  flm_minclude(&this->flm, m, r, alen(r)-1, MFL_OWNED|MFL_MACRO);
+  flm_minclude(&this->flm, m, body, strlen(body), MFL_MACRO);
 }
 
 static void nrm_do_dct(CTX, LHPI, char *m, char *l) { //handles directives
@@ -2767,21 +2753,14 @@ static U32 nrm_process_args(CTX, U32 dsc, char *m, args_info_t *ai) {
 }
 
 static void nrm_do_expr(CTX) { //processes single expression
-  LHP(512); //temporary area for parsing mnemonic and args
+  LHP(1024); //temporary area for parsing mnemonic and args
   char shd[512]; //shadow copy of this input line
 
   cflp_save();
 
-#ifdef NRM_CONTINUOUS_SUBST
-  char *t;
-  RDS(t,!ISNL);
-  char *r = nrm_do_subst(this, LHPA, t);
-  flm_minclude(&this->flm, "<subst>", r, alen(r)-1, MFL_OWNED);
-  LHP_RESET();
+  char *line = nrm_read_subst_line(this, LHPA);
+  flm_minclude(&this->flm, "<subst>", line, LHPTR-1-line, 0);
 
-#endif
-
-  //printf("<DBG>%s\n", cflp->ptr);
 
   cflp_shd(shd);
 
