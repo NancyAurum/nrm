@@ -420,11 +420,14 @@ static url_t *url_parts(char *path) {
 /////////////////////// FILE MANAGER DECLARATIONS //////////////////////////////
 
 /*
-RATIONALE:
-- Portabily. 
-- Flexibility.
-- Speed.
-- Parser housekeeping (row/column, names, etc..).
+
+Macro processors work by repeatedly rewriting the input file.
+They do that top-to-bottom, left-to-right.
+This file manager flm_t facilitates that.
+
+The idea is to keep flp_t.val first item on the context pointer.
+That way nx will result into a single pointer dereference.
+
 */
 
 
@@ -2162,16 +2165,17 @@ static char *nrm_read_macro(CTX) {
 }
 
 static char *nrm_read_subst_line(CTX, LHPI) {
-  int escape = 0;
   char *r = LHPTR;
   while (!ISNL(nx)) {
     int c = rd();
-    if (c == '|') escape = !escape; //dont expand inside |symbols|
-    if (c != '$' || escape) {
+    if (c != '$') {
       LHPUT(c);
       continue;
     }
     char *n = LHPTR;
+    int escape = 0;
+    for (char *p = r; p < n; p++) if (*p == '|') ++escape;
+    if (escape&1) { LHPUT(c); continue;} //dont expand $ inside |symbols|
     RDS(n, issymchr);
     if (nx == '.') rd(); //special char terminating a macro variable reference
     sym_t *s = nrm_sget(n);
