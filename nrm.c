@@ -19,8 +19,6 @@ GOALS:
 
 
 TODO:
-- Macro being able to reference global variables, if local and args fail
-- Local variables, which are limited to macro's scope
 - finish implementing expressions, especially <= and >=,
   these need flm_t improvements
 - `.` and other {VARS}
@@ -31,7 +29,8 @@ TODO:
 - STM/LDM can't have PC as a base or have empty {}
 - STM/LDM after Arch >= 7 doesn't allow writeback into the register that appear in {}
 - replace `strtol` with proper readers
-
+- consult ObjAsm on if label without anything else on a line should
+  be passed to a macro or EQU style directives
 
 NOTES:
 - With 2-pass assembler there are two approaches:
@@ -175,7 +174,18 @@ Coprocessor/SWI instruction format:
 
 //////////////////////////// NRM CONFIGURATION /////////////////////////////////
 
+//uncomment to create a standalone assembler
 #define NRM_STANDALONE
+
+
+//ObjAsm set it to 256
+#define NRM_MAX_MACRO_DEPTH 512
+
+//ObjAsm does `$` substition for every readed line.
+//That can be too slow for a JIT compiler, which doesn't need that
+//Defining the below macro only does `$` subtituion inside macro bodies,
+//Single time at the point of macro call.
+#define NRM_CONTINUOUS_SUBST
 
 
 //////////////////////////// STANDARD INCLUDES /////////////////////////////////
@@ -455,6 +465,8 @@ typedef struct flp_t flp_t;
 struct mfl_t;
 typedef struct mfl_t mfl_t;
 
+struct flmp_t;
+typedef struct flmp_t flmp_t;
 
 struct mfl_t { //memory held file
   U32 desc;     //file description
@@ -469,6 +481,7 @@ struct mfl_t { //memory held file
 };
 
 struct flp_t { //file pointer
+  int val;        //current value
   U8 *ptr;        //current location inside the file
   U8 *end;        //end of the file
   U8 *line;       //start of the current line (used to calculate column)
@@ -500,6 +513,24 @@ static void del_mfl(mfl_t *f) {
   free(f);
 }
 
+
+static void flm_location(flm_t *this, flmp_t *p);
+static void flm_conclude(flm_t *this);
+
+static int flp_next(flp_t *f) { return f->ptr==f->end ? FLE : *f->ptr; }
+
+static int flp_read(flp_t *f) {
+  if (f->ptr == f->end) return FLE;
+  int ch = f->val;
+  if (f->shd) *f->shd++ = ch; //does a shadow copy
+  if (++f->ptr == f->end) flm_conclude(f->fl->flm);
+  else {
+    if (ch == '\n') { f->row++; f->line = f->ptr; }
+    f->val = *f->ptr;
+  }
+  return ch;
+}
+
 static flp_t *new_flp(mfl_t *f) {
   flp_t *fp = malloc(sizeof(flp_t));
   fp->fl = f;
@@ -508,6 +539,7 @@ static flp_t *new_flp(mfl_t *f) {
   fp->line = fp->ptr;
   fp->row = 0;
   fp->shd = 0;
+  fp->val = flp_next(fp);
   return fp;
 }
 
@@ -524,51 +556,34 @@ static void mfl_unref(mfl_t *f) {
 struct flm_t { //file manager
   flp_t flp;       //current file
 
-  TCTX *ctx;
+  TCTX *ctx;       //context/parent object, using filemanager
 
   struct { char *key; mfl_t *value; } *ft;  //file table
 
   //a stack of currently processed files (beside the flp)
   flp_t **fstack;
-  
-  flp_t *tflp_stack;
+
+  flp_t *tflp_stack; //used for temporary redefining input
 
   char **paths; //include directories
 };
 
-typedef struct {
+struct flmp_t {
   int row;
   int col;
   char *macroname;
   char *filename;
-} flmp_t;
-
-static void flm_location(flm_t *this, flmp_t *p);
-static void flm_conclude(flm_t *this);
-
-static int nxF(flp_t *f) { return f->ptr==f->end ? FLE : *f->ptr; }
-
-static int rdF(flp_t *f) {
-  if (f->ptr == f->end) return FLE;
-  U8 ch = *f->ptr++;
-  if (f->shd) *f->shd++ = ch; //does a shadow copy
-  if (f->ptr == f->end)  flm_conclude(f->fl->flm);
-  else {
-    if (ch == '\n') { f->row++; f->line = f->ptr; }
-  }
-  return ch;
-}
+};
 
 
 
 #define cflp (&FLM->flp)
 
-//next char peek
-#define nx nxF(cflp)
+//next value peek
+#define nx cflp->val
 
 //read char
-#define rd() rdF(cflp)
-
+#define rd() flp_read(cflp)
 
 //FIXME: the below macros will fail with windowed files
 
@@ -2025,15 +2040,6 @@ static char *nrm_read_macro(CTX) {
   s->desc = VAL_MACRO;
   s->v.v = v;
 }
-
-//ObjAsm set it to 256
-#define NRM_MAX_MACRO_DEPTH 512
-
-//ObjAsm does `$` substition for every readed line.
-//That can be too slow for a JIT compiler, which doesn't need that
-//Defining the below macro only does `$` subtituion inside macro bodies,
-//Single time at the point of macro call.
-#define NRM_CONTINUOUS_SUBST
 
 static char *nrm_do_subst(CTX, LHPI, char *expr) {
   int escape = 0;
