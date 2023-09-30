@@ -258,6 +258,7 @@ INTRODUCE(nrm_t)
 
 /////////////////////////////// UTILITIES //////////////////////////////////////
 
+static int nrm_dbg = 0;
 
 //file end
 #define ISFLE(x) ((x) == FLE)
@@ -1287,7 +1288,7 @@ static void flm_location(flm_t *this, flmp_t *p) {
 
 static void flm_push(flm_t *this, mfl_t *f) {
   mfl_ref(f);
-  if (!f->size) {
+  if (!f->size && !(f->desc&MFL_ROOT)) {
     mfl_unref(f);
     return; //dont push empty files
   }
@@ -1307,7 +1308,7 @@ static ku_t *flm_incnts = NULL;
 
 static void flm_minclude(flm_t *this, char *name, U8 *base, U32 size, U32 flags)
 {
-  if (!size) { //happens with empty lines all the time
+  if (!size && !(flags&MFL_ROOT)) { //happens with empty lines all the time
     if (flags&MFL_OWNED) arrfree(base);
     return;
   }
@@ -1873,6 +1874,7 @@ read_hex_num:
     rd();
     nrm_read_num(this, LHPA, 16, r);
   } else if (c == '.') {
+    rd();
 term_pc:
     r->desc = VAL_ARITH;
     r->v.w = C.pc;
@@ -2273,19 +2275,18 @@ enter_while:
       fatal("DCB value is invalid");
     }
   } else if (dct == NRM_D_DCD) {
-    if (nx == '&') {
-      rd();
-      READ_NUM(v,16);
-      nrm_outw(this, v);
-    } else {
+    nrm_eval(this, &r);
+    if (r.desc != VAL_ARITH && r.desc != VAL_LOGIC) {
       fatal("DCD value is invalid");
     }
+    nrm_outw(this, r.v.w);
   } else if (dct == NRM_D_ALIGN) { //FIXME: implement optional arguments
     while (alen(C.out)&0x3) aput(C.out, 0);
   } else if (dct == NRM_D_END) {
   } else{
     fatal("directive `%s` is unimplemented", m);
   }
+  if (!strcmp(m,"END")) nrm_dbg = 1;
   nrm_skip_line(this);
 }
 
@@ -2680,13 +2681,13 @@ static void nrm_do_expr(CTX) { //processes single expression
 
   cflp_save();
 
-
 #ifdef NRM_CONTINUOUS_SUBST
   char *t;
   RDS(t,!ISNL);
   char *r = nrm_do_subst(this, LHPA, t);
   flm_minclude(&this->flm, "<subst>", r, alen(r)-1, MFL_OWNED);
   LHP_RESET();
+
 #endif
 
   //printf("<DBG>%s\n", cflp->ptr);
@@ -2700,6 +2701,7 @@ static void nrm_do_expr(CTX) { //processes single expression
   }
 
   char *m = nrm_read_mnemonic(this,LHPA);
+
 
   U32 dsc = nrm_parse_mnemonic(this, m);
   if (dsc == NRM_BAD_OPCODE) {
