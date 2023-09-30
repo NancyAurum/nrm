@@ -19,8 +19,6 @@ GOALS:
 
 
 TODO:
-- finish implementing expressions, especially <= and >=,
-  these need flm_t improvements
 - `.` and other {VARS}
 - ROUT and local labels, which are useful for macros
 - handle |labels| and |variables|
@@ -592,7 +590,7 @@ struct flmp_t {
 //next value peek
 #define nx cflp->val
 
-//next ith value fix
+//next ith value peek
 #define ith(i) flp_nextI(cflp, i) 
 
 //read char
@@ -1289,6 +1287,10 @@ static void flm_location(flm_t *this, flmp_t *p) {
 
 static void flm_push(flm_t *this, mfl_t *f) {
   mfl_ref(f);
+  if (!f->size) {
+    mfl_unref(f);
+    return; //dont push empty files
+  }
   U8 *shd = 0;
   if (alen(C.fstack)) {
     *alast(C.fstack) = C.flp;
@@ -1305,6 +1307,10 @@ static ku_t *flm_incnts = NULL;
 
 static void flm_minclude(flm_t *this, char *name, U8 *base, U32 size, U32 flags)
 {
+  if (!size) { //happens with empty lines all the time
+    if (flags&MFL_OWNED) arrfree(base);
+    return;
+  }
   if (!flm_incnts) {
     shdefault(flm_incnts,0);
     sh_new_arena(flm_incnts);
@@ -1866,6 +1872,10 @@ read_num:
 read_hex_num:
     rd();
     nrm_read_num(this, LHPA, 16, r);
+  } else if (c == '.') {
+term_pc:
+    r->desc = VAL_ARITH;
+    r->v.w = C.pc;
   } else if (c == '{') {
     char *s;
     int tc = '}';
@@ -1878,6 +1888,8 @@ read_hex_num:
     } else if (!strcmp(s,"FALSE")) {
       r->desc = VAL_LOGIC;
       r->v.w = 0;
+    } else if (!strcmp(s,"PC")) {
+      goto term_pc;
     } else {
       fatal("builtin variable {%s} is unknown", s);
     }
@@ -1912,9 +1924,15 @@ again:
     SKPWS();
     sym_t t;
     nrm_eval_add(this, LHPA, &t);
-    if (op == '<') r->v.w = r->v.w < t.v.w;
-    else if (op == '>') r->v.w = r->v.w > t.v.w;
-    else r->v.w = r->v.w == t.v.w;
+    U32 w;
+    if (op == '<') {
+      if (nx == '=') {rd(); w = r->v.w <= t.v.w;}
+      else w = r->v.w < t.v.w;
+    } else if (op == '>') {
+      if (nx == '=') {rd(); w = r->v.w >= t.v.w;}
+      else w = r->v.w > t.v.w;
+    } else w = r->v.w == t.v.w;
+    r->v.w = w;
     r->desc = VAL_LOGIC;
     goto again;
   }
@@ -2662,6 +2680,7 @@ static void nrm_do_expr(CTX) { //processes single expression
 
   cflp_save();
 
+
 #ifdef NRM_CONTINUOUS_SUBST
   char *t;
   RDS(t,!ISNL);
@@ -2670,6 +2689,7 @@ static void nrm_do_expr(CTX) { //processes single expression
   LHP_RESET();
 #endif
 
+  //printf("<DBG>%s\n", cflp->ptr);
 
   cflp_shd(shd);
 
@@ -2680,8 +2700,6 @@ static void nrm_do_expr(CTX) { //processes single expression
   }
 
   char *m = nrm_read_mnemonic(this,LHPA);
-  
-  //fprintf(stderr, "%s\n", m);
 
   U32 dsc = nrm_parse_mnemonic(this, m);
   if (dsc == NRM_BAD_OPCODE) {
