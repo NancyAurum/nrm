@@ -486,7 +486,7 @@ struct flp_t { //file pointer
   U8 *end;        //end of the file
   U8 *line;       //start of the current line (used to calculate column)
   U32 row;        //line counter
-  mfl_t *fl;      //the file handle
+  mfl_t *file;    //the file handle
   //flp_t *prev;    //OBSOLETE: for reading files which include other files
                     //use nrm_t->fstack  instead,
                     //since one file can be opened several times
@@ -523,7 +523,7 @@ static int flp_read(flp_t *f) {
   if (f->ptr == f->end) return FLE;
   int ch = f->val;
   if (f->shd) *f->shd++ = ch; //does a shadow copy
-  if (++f->ptr == f->end) flm_conclude(f->fl->flm);
+  if (++f->ptr == f->end) flm_conclude(f->file->flm);
   else {
     if (ch == '\n') { f->row++; f->line = f->ptr; }
     f->val = *f->ptr;
@@ -533,7 +533,7 @@ static int flp_read(flp_t *f) {
 
 static flp_t *new_flp(mfl_t *f) {
   flp_t *fp = malloc(sizeof(flp_t));
-  fp->fl = f;
+  fp->file = f;
   fp->ptr = f->base;
   fp->end = f->base + f->size;
   fp->line = fp->ptr;
@@ -606,7 +606,7 @@ struct flmp_t {
 #define cflp_load() do {*cflp = *cflp_saved();} while (0)
 
 #define FLLOC(R,C,N,F) int R = (F)->row; int C = FL_COL(F); \
-                       char *N = (F)->fl->name;
+                       char *N = (F)->file->name;
 
 //////////////////////////// SYMBOL TABLE //////////////////////////////////////
 
@@ -1187,7 +1187,7 @@ static mfl_t *mfl_open(CTX, char *filename) {
 static void flm_deinit(flm_t *this) {
   for (int i = 0; i < alen(this->fstack); i++) {
     flp_t *fp = this->fstack[i];
-    fp->fl = 0;
+    fp->file = 0;
     del_flp(fp);
   }
   //arrfree(this->fstack);
@@ -1210,7 +1210,7 @@ static flp_t *flm_cur_file(flm_t *this) {
   int nfiles = alen(this->fstack);
   for (int i =  nfiles-1; i >= 0; i--) {
     flp_t *p = this->fstack[i];
-    if (p->fl->desc&MFL_FS) return p;
+    if (p->file->desc&MFL_FS) return p;
   }
   return 0;
 }
@@ -1239,7 +1239,7 @@ static char *flm_resolve(flm_t *this, char *rel_name) {
       if (nonlocal || !cfp) {
         continue;
       }
-      folder = cfp->fl->url->dir; //try current dir
+      folder = cfp->file->url->dir; //try current dir
     } else {
       folder = ps[i];
     }
@@ -1260,11 +1260,11 @@ static void flm_location(flm_t *this, flmp_t *p) {
   p->col = 0;
   for (int i = alen(C.fstack)-1; i >= 0; i--) {
     flp_t *fp = C.fstack[i];
-    if (fp->fl->desc & MFL_MACRO) {
-      if (!p->macroname) p->macroname = fp->fl->name;
+    if (fp->file->desc & MFL_MACRO) {
+      if (!p->macroname) p->macroname = fp->file->name;
     } else {
       if (!p->filename) {
-        p->filename = fp->fl->name;
+        p->filename = fp->file->name;
         p->row = fp->row;
         p->col = FL_COL(fp);
       }
@@ -1305,11 +1305,11 @@ static void flm_minclude(flm_t *this, char *name, U8 *base, U32 size, U32 flags)
 
 static void flm_conclude(flm_t *this) {
   U8 *shd = C.flp.shd;
-  if (C.flp.fl->desc&MFL_ROOT) return; // can't pop root
+  if (C.flp.file->desc&MFL_ROOT) return; // can't pop root
   flp_t *fp = apop(C.fstack);
   C.flp = *alast(C.fstack);
   C.flp.shd = shd;
-  mfl_t *f = fp->fl;
+  mfl_t *f = fp->file;
   if (f->ovrd) shput(C.ft, f->name, f->ovrd); //uncover old entry
   del_flp(fp);
   mfl_unref(f);
