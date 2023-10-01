@@ -511,8 +511,7 @@ static void del_mfl(mfl_t *f) {
 
 
 static void flm_location(flm_t *this, flmp_t *p);
-static void flm_minclude(flm_t *this, char *name, U8 *base
-                        ,U32 size, U32 flags);
+static void flm_include(flm_t *this, char *name, U8 *base,U32 size, U32 flags);
 static void flm_conclude(flm_t *this);
 
 static int flp_next(flp_t *f) { return f->ptr==f->end ? FLE : *f->ptr; }
@@ -539,7 +538,7 @@ static int flp_nextI(flp_t *f, int i) {
     if (v == FLE) break;
     aput(r, v);
   }
-  if (j != i) flm_minclude(f->file->flm, "<peek>", r, alen(r), MFL_OWNED);
+  if (j != i) flm_include(f->file->flm, "<peek>", r, alen(r), MFL_OWNED);
   return j ? FLE : f->ptr[i];
 }
 
@@ -1310,8 +1309,7 @@ static void flm_push(flm_t *this, mfl_t *f) {
 //include counter for each encountered file
 static ku_t *flm_incnts = NULL;
 
-static void flm_minclude(flm_t *this, char *name, U8 *base, U32 size, U32 flags)
-{
+static void flm_include(flm_t *this, char *name, U8 *base, U32 size, U32 flags){
   if (!size && !(flags&MFL_ROOT)) { //happens with empty lines all the time
     if (flags&MFL_OWNED) arrfree(base);
     return;
@@ -1341,7 +1339,7 @@ static void flm_conclude(flm_t *this) {
 
 
 
-static void flm_include(flm_t *this, char *rel_name) {
+static void flm_includef(flm_t *this, char *rel_name) {
   char *resolved_name = 0;
   char *filename;
   if (alen(C.fstack)) resolved_name = flm_resolve(this, rel_name);
@@ -1372,7 +1370,7 @@ static void flm_init(flm_t *this, TCTX *ctx) {
   this->ctx = ctx;
   sh_new_arena(this->ft); //copies keys to internal store
   this->paths = ctx->opt.paths;
-  flm_minclude(this, "", "", 0, MFL_ROOT);
+  flm_include(this, "", "", 0, MFL_ROOT);
 }
 
 
@@ -1612,11 +1610,11 @@ static void del_nrm(CTX) {
 
 
 void nrm_cstr(CTX, char *cstr) {
-  flm_minclude(&this->flm, "<cstr>", cstr, strlen(cstr), 0);
+  flm_include(&this->flm, "<cstr>", cstr, strlen(cstr), 0);
 }
 
 void nrm_include(CTX, char *filename) {
-  flm_include(&C.flm, filename);
+  flm_includef(&C.flm, filename);
 }
 
 
@@ -1874,27 +1872,9 @@ static void nrm_outw(CTX, U32 w) {
 
 static char *nrm_read_label(CTX,LHPI) {
   char *l;
-  //ObjAsm labels variables always begin at the start of a line,
-  //everything else gets indented.
-read_label:
-  if (ISWS(nx)) {
-    l =  "";
-    SKPWS();
-  } else if (nx == ';') {
-    nrm_skip_comment(this);
-    goto read_label;
-  } else { 
-    RDS(l,!ISWSNLC); SKPWS();
-  }
-read_nl:
-  if (nx == '\n') {
-    rd();
-    if (*l) {
-      SKPWS();
-      goto read_nl;
-    }
-    goto read_label;
-  }
+  if (ISWS(nx) || nx == ';') { SKPWS();  return "";}
+  RDS(l,!ISWSNLC);
+  SKPWS();
   return l;
 }
 
@@ -1923,7 +1903,7 @@ arg_retry:
     sym_t *sym = nrm_sget(s);
     if (sym) {
       if (sym->desc == VAL_EQU) {
-        flm_minclude(&this->flm, "<EQU>", s, strlen(s), 0);
+        flm_include(&this->flm, "<EQU>", s, strlen(s), 0);
         goto arg_retry;
       } else if (sym->desc == VAL_LBL || sym->desc == VAL_ARITH) {
         r->desc = VAL_ARITH;
@@ -2246,7 +2226,7 @@ static void nrm_do_macro(CTX, char *m, char *l, sym_t *s) {
   }
   arrfree(vs);
 
-  flm_minclude(&this->flm, m, body, strlen(body), MFL_MACRO);
+  flm_include(&this->flm, m, body, strlen(body), MFL_MACRO);
 }
 
 static void nrm_do_dct(CTX, LHPI, char *m, char *l) { //handles directives
@@ -2300,7 +2280,7 @@ static void nrm_do_dct(CTX, LHPI, char *m, char *l) { //handles directives
     nrm_skip_line(this);
 enter_while:
     char *body = alast(C.whlstk);
-    flm_minclude(&C.flm, "<WHILE>", body, strlen(body), 0);
+    flm_include(&C.flm, "<WHILE>", body, strlen(body), 0);
     nrm_eval(this, &r);
     if (!r.v.w) {
       flm_conclude(&C.flm);
@@ -2423,7 +2403,7 @@ arg_retry:
         a->desc = NRM_ARG_REG;
         a->v.w = sym->v.w;
       } else if (sym->desc == VAL_EQU) {
-        flm_minclude(&this->flm, "<EQU>", sym->v.s, strlen(sym->v.s), 0);
+        flm_include(&this->flm, "<EQU>", sym->v.s, strlen(sym->v.s), 0);
         goto arg_retry;
       } else if (sym->desc == VAL_LBL) {
         a->desc = NRM_ARG_IMM;
@@ -2780,24 +2760,21 @@ static U32 nrm_process_args(CTX, U32 dsc, char *m, args_info_t *ai) {
 
 static void nrm_do_expr(CTX) { //processes single expression
   LHP(1024); //temporary area for parsing mnemonic and args
-  char shd[512]; //shadow copy of this input line
 
   cflp_save();
 
   char *line = nrm_read_subst_line(this, LHPA);
-  flm_minclude(&this->flm, "<subst>", line, LHPTR-1-line, 0);
-
-
-  cflp_shd(shd);
+  flm_include(&this->flm, "<subst>", line, LHPTR-1-line, 0);
 
   char *l = nrm_read_label(this,LHPA);
-  if (ISFLE(nx) && *l) {
-    nrm_set_label(this, l, this->pc);
+  if (ISNLC(nx)) { //empty or single label line?
+    if (nx == '\n') rd();
+    else if (nx == ';')  nrm_skip_comment(this);
+    if (*l) nrm_set_label(this, l, this->pc);
     return;
   }
 
   char *m = nrm_read_mnemonic(this,LHPA);
-
 
   U32 dsc = nrm_parse_mnemonic(this, m);
   if (dsc == NRM_BAD_OPCODE) {
@@ -2811,7 +2788,7 @@ static void nrm_do_expr(CTX) { //processes single expression
   //fprintf(stderr, "%x\n", dsc);
 
   args_info_t ai;
-  ai.shd = shd;
+  ai.shd = line;
   if (nrm_parse_args(this, LHPA, dsc, &ai)) return; //cant compile it right now
 
   //skip comment till EOL
@@ -2844,12 +2821,12 @@ static uint8_t *nrm_do(CTX) { //process entire S file
 
   for (int i = 0; i < alen(C.dld); i++) {
     C.dldi = i;
-    flm_minclude(&this->flm, C.dld[i].name, C.dld[i].expr
-                ,strlen(C.dld[i].expr), 0);
+    dld_t *d = C.dld;
+    flm_include(&this->flm, d[i].name, d[i].expr,strlen(d[i].expr), 0);
     U32 spc = alen(C.out);
-    this->pc = C.dld[i].pc;
+    this->pc = d[i].pc;
     nrm_do_expr(this);
-    U32 dpc = C.dld[i].pc;
+    U32 dpc = d[i].pc;
     while (spc < alen(C.out)) r[dpc++] = C.out[spc++]; //patch it
   }
   arrfree(C.out);

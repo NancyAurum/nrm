@@ -1,0 +1,73 @@
+        00008000 00 00 a0 e1     mov        r0,r0
+        00008004 00 00 a0 e1     mov        r0,r0
+        00008008 00 00 a0 e1     mov        r0,r0
+        0000800c 1b 00 00 eb     bl         entry                                            void entry(void)
+        00008010 11 00 00 ef     swi        0x11
+                             ro_sz
+        00008014 ac 00 00 00     ddw        ACh
+                             rw_sz
+        00008018 00 00 00 00     ddw        0h
+                             debug_sz
+        0000801c 00 00 00 00     ddw        0h
+                             zero_sz
+        00008020 00 00 00 00     ddw        0h
+                             debug_type
+        00008024 00 00 00 00     ddw        0h
+                             base
+        00008028 00 80 00 00     ddw        8000h
+                             workspace
+        0000802c 00 00 00 00     ddw        0h
+                             mode
+        00008030 1a 00 00 00     ddw        1Ah
+                             data_base
+        00008034 00 00 00 00     ddw        0h
+                             reserved1
+        00008038 00 00 00 00     ddw        0h
+                             reserved2
+        0000803c 00 00 00 00     ddw        0h
+                             bl_debug_init
+        00008040 00 00 a0 e1     mov        r0,r0
+                             **************************************************************
+                             *                          FUNCTION                          *
+                             **************************************************************
+                             void zero_init(void)             ;this one clears .bss segment
+             void              <VOID>         <RETURN>
+                             zero_init                        ;we BL here from 8008, when it is non NOP
+        00008044 0f c0 4e e0     sub        r12,lr,pc         ;r12 = 0x800c - 0x804c = -0x40
+        00008048 0c c0 8f e0     add        r12,pc,r12        ;r12 = 0x8050 + -0x40 = 0x8010
+        0000804c 0f 00 9c e9     ldmib      r12,{r0,r1,r2,r3} ;read 4 values from [0x8010 + 4 = 8014]
+                                                              ;b means add 4 to r12, before reading
+                                                              ;r0=ro_sz, r1=rw_sz, r2=debug_sz, r3=zero_sz
+        00008050 10 c0 4c e2     sub        r12,r12,#0x10     ;0x8020 - 0x10 = 0x8010
+        00008054 30 20 9c e5     ldr        r2,[r12,#0x30]    ;r2 = word from bl_debug_init
+        00008058 01 0c 12 e3     tst        r2,#0x100         ;test debug bit
+        0000805c 34 c0 9c 15     ldrne      r12,[r12,#0x34]   ;init destination based on on debug opcode
+        00008060 00 c0 8c 00     addeq      r12,r12,r0        ;r12 + ro_sz
+        00008064 01 c0 8c e0     add        r12,r12,r1        ;r12 + rw_sz
+        00008068 00 00 a0 e3     mov        r0,#0x0           ;value we will be clearing memory with
+        0000806c 00 00 53 e3     cmp        r3,#0x0           ;is .bss empty?
+                             LAB_00008070                                    XREF[1]:     0000807c(j)  
+        00008070 0e f0 a0 d1     movle      pc,lr             ;if (!count) return
+        00008074 04 00 8c e4     str        r0,[r12],#0x4     ;*bss_ptr++ = 0
+        00008078 04 30 53 e2     subs       r3,r3,#0x4        ;count -= 4
+        0000807c fb ff ff ea     b          LAB_00008070
+                             **************************************************************
+                             *                          FUNCTION                          *
+                             **************************************************************
+                             void entry(void)
+             void              <VOID>         <RETURN>
+                             entry                                           XREF[1]:     0000800c(c)  
+        00008080 01 00 00 ef     swi        0x1               ; OS_WriteS
+        00008084 48 65 6c        ds         "Hello, world!"
+                 6c 6f 2c 
+                 20 77 6f 
+        00008094 03 00 00 ef     swi        0x3               ; OS_NewLine
+        00008098 00 00 a0 e3     mov        r0,#0x0           ; pointer to error buffer
+        0000809c 04 10 9f e5     ldr        r1,[abex]         ; ABEX = set return code
+        000080a0 00 20 a0 e3     mov        r2,#0x0           ; return code
+        000080a4 11 00 00 ef     swi        0x11              ; OS_Exit
+                             abex                                            XREF[1]:     0000809c(R)  
+        000080a8 41              char       'A'
+        000080a9 42              char       'B'
+        000080aa 45              char       'E'
+        000080ab 58              char       'X'
