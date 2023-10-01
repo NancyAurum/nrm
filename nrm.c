@@ -334,6 +334,9 @@ typedef struct {
 #define LHPUT(v) do {if (lhp_->p == lhp_->e) fatal("line is too long."); \
                      *lhp_->p++ = (v); } while (0)
 
+#define LHPUTS(s) do { for (char *p = (s); *p; *p++) LHPUT(*p); } while (0)
+
+
 //read characters by calling rd(), while tst(nx) is true
 //assumes hp points to a temporary heap buffer and he points to its end
 #define RDS(dst,tst) do {                              \
@@ -427,6 +430,7 @@ This file manager flm_t facilitates that.
 
 The idea is to keep flp_t.val first item on the context pointer.
 That way nx will result into a single pointer dereference.
+rdF() does some row/column house-keeping for the user code.
 
 */
 
@@ -1086,8 +1090,7 @@ static void nrm_init_globals() {
   for (ku_t *o = opcs; o->key; o++) shput(opcm, o->key, o->value);
 
   shdefault(cndm,NRM_BAD_OPCODE);
-  for (ku_t *o = cnds; o->key; o++) shput(opcm, o->key, o->value<<28);
-
+  for (ku_t *o = cnds; o->key; o++) shput(cndm, o->key, o->value<<28);
 
   shdefault(sftm,NRM_S_NIL);
   for (ku_t *o = sfts; o->key; o++) shput(sftm, o->key, o->value);
@@ -1128,15 +1131,16 @@ typedef struct { //represents expression delayed for the 2nd pass
   char *name;
   int row;
   int col;
+  int rout; //routine index
 } dld_t;
 
 
 struct nrm_t { // NRM's state
   flm_t flm;       //file manager
   nrm_opt_t opt;   //user specified options
-  //scope_t st;    //symbol map
-  scope_t *ss;   //symbol scopes
+  scope_t *ss;     //symbol scopes
   sym_t **sl;      //symbol list
+  char **routs;    //ROUT area names
   int ifdepth;     //depth of if/else nesting
   int mdepth;      //macro expansion depth
   char **whlstk;   //stack of nested whiles
@@ -1545,23 +1549,35 @@ void nrm_opt_init(nrm_opt_t *o) {
 
 
 //assign's name to a register indexed by index
-void nrm_name_reg(CTX, char *name, int index) {
+static void nrm_name_reg(CTX, char *name, int index) {
   sym_t *s = nrm_sref(this,name);
   s->desc = VAL_REG;
   s->v.w = index;
 }
 
-void nrm_open_scope(CTX) {
+static void nrm_open_scope(CTX) {
+  int last = alen(C.ss);
   aput(C.ss, 0);
-  int last = alen(C.ss)-1;
   sh_new_arena(C.ss[last]);
 }
 
-void nrm_close_scope(CTX) {
+static void nrm_close_scope(CTX) {
   scope_t s = apop(C.ss);
   shfree(s);
 }
 
+static U32 nrm_orgpc(CTX) {
+  return C.pc + C.org;
+}
+
+static void nrm_add_rout(CTX, char *name) {
+  char tmp[32];
+  if (!name) {
+    snprintf(tmp, 32, "%d", nrm_orgpc(this));
+    name = tmp;
+  }
+  aput(C.routs, strdup(name));
+}
 
 
 void nrm_init(CTX, nrm_opt_t *opt) {
@@ -1773,9 +1789,10 @@ static U32 nrm_parse_mnemonic(CTX, char *mm) {
     strncpy(t, m, 3);
     t[3] = 0;
     dsc = shget(opcm, t) | (NRM_AL<<28);
-    if (NRM_IS_STLDM(dsc)) return parse_stldm_type(dsc,m+3);
+    if (NRM_IS_STLDM(dsc)) return parse_stldm_type(dsc,m+3) | (NRM_AL<<28);
+
     if (m[3] == 'B' && m[4] == 'T' && NRM_IS_STLD(dsc)) {
-      dsc |= NRM_STLD_BYTE|NRM_STLD_TRANS;
+      dsc |= NRM_STLD_BYTE|NRM_STLD_TRANS | (NRM_AL<<28);
     } else {
       dsc |= shget(cndm, m+3);
     }
@@ -1785,8 +1802,9 @@ static U32 nrm_parse_mnemonic(CTX, char *mm) {
   case 6:
     strncpy(t, m, 3);
     t[3] = 0;
-    dsc = shget(opcm, m);
+    dsc = shget(opcm, t);
     strncpy(t, m+3, 2);
+    t[2] = 0;
     dsc |= shget(cndm, t);
     if (NRM_IS_DP(dsc)) { //ADDEQS, etc..
       if (m[5] != 'S') return NRM_BAD_OPCODE;
@@ -2338,6 +2356,9 @@ enter_while:
     //ignored for now
   } else if (dct == NRM_D_ENTRY) {
     //for now we assume 1st opcode to be entry
+  } else if (dct == NRM_D_ROUT) {
+    nrm_add_rout(this, l);
+    //in this case we don't consume label.
   } else if (dct == NRM_D_DCB) {
     if (nx == '\"') {
       rd();
@@ -2363,6 +2384,7 @@ enter_while:
   } else if (dct == NRM_D_ALIGN) { //FIXME: implement optional arguments
     while (alen(C.out)&0x3) aput(C.out, 0);
   } else if (dct == NRM_D_END) {
+    //FIXME pop here everythin from the file stack
   } else{
     fatal("directive `%s` is unimplemented", m);
   }
@@ -2646,6 +2668,7 @@ static U32 nrm_process_args(CTX, U32 dsc, char *m, args_info_t *ai) {
 
       if (as[2].desc == NRM_ARG_REG) dsc |= as[2].v.w;
       else if (as[2].desc == NRM_ARG_SFT) dsc |= as[2].v.w;
+      else if (as[2].desc == NRM_ARG_IMM) dsc |= as[2].v.w;
       else fatal("operand 2 is invalid");
     }
 
