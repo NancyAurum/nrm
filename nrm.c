@@ -2198,7 +2198,7 @@ static void nrm_do_macro(CTX, char *m, char *l, sym_t *s) {
   dvs = mv[1]; //default values
   body = mv[2];
   char **vs = 0;
-
+  
   aput(vs, l);
 
   SKPWS();
@@ -2212,9 +2212,8 @@ static void nrm_do_macro(CTX, char *m, char *l, sym_t *s) {
     if (!strcmp(v,"|")) v = dvs[alen(vs)];
     aput(vs, v);
   }
-  while (alen(vs) < alen(as)) {
-    aput(vs,"");
-  }
+  while (alen(vs) < alen(as)) aput(vs,dvs[alen(vs)]);
+
   nrm_skip_line(this);
 
   nrm_open_scope(this);
