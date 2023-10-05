@@ -1137,8 +1137,9 @@ typedef struct { //represents expression delayed for the 2nd pass
 struct nrm_t { // NRM's state
   flm_t flm;       //file manager
   nrm_opt_t opt;   //user specified options
-  scope_t *ss;     //symbol scopes
-  sym_t **sl;      //symbol list
+  int *ss;          //scopes stack
+  scope_t *sl;     //scopes list (all scopes)
+  sym_t **syms;    //symbol list (all symbols)
   char **routs;    //ROUT area names
   int ifdepth;     //depth of if/else nesting
   int mdepth;      //macro expansion depth
@@ -1472,7 +1473,8 @@ static int nrm_dump_aif(char *filename, uint8_t *r, uint32_t len) {
 #define SCP_LOCAL  2
 
 static sym_t *nrm_sref_h(CTX, char *name, int limit) {
-  scope_t *ss = C.ss;
+  int *ss = C.ss;
+  scope_t *sl = C.sl;
   int start, end;
   if (!limit) {
     start = alen(ss)-1;
@@ -1488,15 +1490,15 @@ static sym_t *nrm_sref_h(CTX, char *name, int limit) {
     end = 1;
   }
   for (int i = start; i >= end; i--) {
-    sym_t *s = shget(ss[i], name);
+    sym_t *s = shget(sl[ss[i]], name);
     if (s) return s;
   }
   sym_t *s = malloc(sizeof(sym_t));
   memset(s, 0, sizeof(sym_t));
   s->desc = VAL_NON;
   s->name = strdup(name);
-  shput(C.ss[start], name, s);
-  aput(C.sl, s);
+  shput(sl[ss[start]], name, s);
+  aput(C.syms, s);
   return s;
 }
 
@@ -1511,7 +1513,8 @@ static sym_t *nrm_gbl_ref(CTX, char *name, int desc) {
 }
 
 static sym_t *nrm_sget_h(CTX, char *name, int limit) {
-  scope_t *ss = C.ss;
+  int *ss = C.ss;
+  scope_t *sl = C.sl;
   int start, end;
   if (!limit) {
     start = alen(ss)-1;
@@ -1528,7 +1531,7 @@ static sym_t *nrm_sget_h(CTX, char *name, int limit) {
   }
   
   for (int i = start; i >= end; i--) {
-    sym_t *s = shget(ss[i], name);
+    sym_t *s = shget(sl[ss[i]], name);
     if (s) return s;
   }
   return 0;
@@ -1554,14 +1557,15 @@ static void nrm_name_reg(CTX, char *name, int index) {
 }
 
 static void nrm_open_scope(CTX) {
-  int last = alen(C.ss);
-  aput(C.ss, 0);
-  sh_new_arena(C.ss[last]);
+  int id = alen(C.sl);
+  scope_t s = 0;
+  sh_new_arena(s);
+  aput(C.sl, s);
+  aput(C.ss, id);
 }
 
 static void nrm_close_scope(CTX) {
-  scope_t s = apop(C.ss);
-  shfree(s);
+  apop(C.ss);
 }
 
 static U32 nrm_orgpc(CTX) {
@@ -1601,8 +1605,12 @@ static nrm_t *new_nrm(nrm_opt_t *opt) {
 }
 
 static void del_nrm(CTX) {
+  int i;
   nrm_close_scope(this);
-  for (int i = 0; i < alen(C.whlstk); i++) arrfree(C.whlstk[i]);
+  for (i = 0; i < alen(C.whlstk); i++) arrfree(C.whlstk[i]);
+  for (i = 0; i < alen(C.sl); i++) shfree(C.sl[i]);
+  arrfree(C.sl);
+  arrfree(C.ss);
   arrfree(C.whlstk);
   flm_deinit(&this->flm);
   free(this);
