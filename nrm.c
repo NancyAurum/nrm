@@ -1562,6 +1562,9 @@ static void nrm_open_scope(CTX) {
   sh_new_arena(s);
   aput(C.sl, s);
   aput(C.ss, id);
+  sym_t *sym = nrm_sref_h(this, "NRM|UP", SCP_LOCAL);
+  sym->desc = VAL_ARITH;
+  sym->v.w = id;
 }
 
 static void nrm_close_scope(CTX) {
