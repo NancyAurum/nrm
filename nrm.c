@@ -577,6 +577,7 @@ struct flm_t { //file manager
   flp_t *tflp_stack; //used for temporary redefining input
 
   char **paths; //include directories
+  int row;  // global row
 };
 
 struct flmp_t {
@@ -675,6 +676,7 @@ typedef struct {
   char *name; //index inside the name table
   U32 desc; //description of the symbol
   val_t v; //value of the symbol
+  int row;
 } sym_t;
 
 typedef struct { char *key; sym_t *value; } *scope_t;
@@ -1152,6 +1154,7 @@ struct nrm_t { // NRM's state
   U32 pc;          //have to maintain a separate one
                    //because out could be broken into parts
   int dldi;
+  int row;
 };
 
 
@@ -1175,7 +1178,7 @@ static void fatalF(CTX, char *fmt, ...) {
   va_start(ap, fmt);
   vsprintf(s, fmt, ap);
   va_end(ap);
-  C.opt.fatal(this, p.macroname, p.filename, p.row, p.col, s);
+  C.opt.fatal(this, p.macroname, p.filename, C.row, p.col, s);
 
   exit(-1);
 }
@@ -1274,19 +1277,22 @@ static void flm_location(flm_t *this, flmp_t *p) {
   p->macroname = 0;
   p->row = 0;
   p->col = 0;
+  char *fs_name = 0;
   for (int i = alen(C.fstack)-1; i >= 0; i--) {
     flp_t *fp = C.fstack[i];
-    if (fp->file->desc & MFL_MACRO) {
-      if (!p->macroname) p->macroname = fp->file->name;
+    mfl_t *f = fp->file;
+    if (f->desc & MFL_MACRO) {
+      if (!p->macroname) p->macroname = f->name;
     } else {
+      if ((f->desc&MFL_FS) && !fs_name) fs_name = f->name;
       if (!p->filename) {
-        p->filename = fp->file->name;
+        p->filename = f->name;
         p->row = fp->row;
         p->col = FL_COL(fp);
       }
     }
   }
-  
+  if (fs_name) p->filename = fs_name;
   if (!p->filename) p->filename = "<none>";
 }
 
@@ -1300,6 +1306,7 @@ static void flm_push(flm_t *this, mfl_t *f) {
   if (alen(C.fstack)) {
     *alast(C.fstack) = C.flp;
     shd = C.flp.shd;
+    C.row += C.flp.row;
   }
   flp_t *fp = new_flp(f);
   aput(C.fstack, fp);
@@ -1328,10 +1335,12 @@ static void flm_include(flm_t *this, char *name, U8 *base, U32 size, U32 flags){
 
 static void flm_conclude(flm_t *this) {
   U8 *shd = C.flp.shd;
+  C.row += C.flp.row;
   if (C.flp.file->desc&MFL_ROOT) return; // can't pop root
   flp_t *fp = apop(C.fstack);
   C.flp = *alast(C.fstack);
   C.flp.shd = shd;
+  C.row -= C.flp.row;
   mfl_t *f = fp->file;
   if (f->ovrd) shput(C.ft, f->name, f->ovrd); //uncover old entry
   del_flp(fp);
@@ -1372,7 +1381,13 @@ static void flm_init(flm_t *this, TCTX *ctx) {
   sh_new_arena(this->ft); //copies keys to internal store
   this->paths = ctx->opt.paths;
   flm_include(this, "", "", 0, MFL_ROOT);
+  this->row = 0;
 }
+
+static int flm_row(flm_t *this) {
+  return C.row + C.flp.row;
+}
+
 
 
 /////////////////////////////// AIF SUPPORT ////////////////////////////////////
@@ -1471,6 +1486,7 @@ static int nrm_dump_aif(char *filename, uint8_t *r, uint32_t len) {
 #define SCP_ALL    0
 #define SCP_GLOBAL 1
 #define SCP_LOCAL  2
+#define SCP_CUR    3
 
 static sym_t *nrm_sref_h(CTX, char *name, int limit) {
   int *ss = C.ss;
@@ -1485,6 +1501,9 @@ static sym_t *nrm_sref_h(CTX, char *name, int limit) {
   } else if (limit == SCP_LOCAL) {
     start = alen(ss)-1;
     end = 1;
+  } else if (limit == SCP_CUR) {
+    start = alen(ss)-1;
+    end = start;
   } else {
     start = 0;
     end = 1;
@@ -1497,6 +1516,7 @@ static sym_t *nrm_sref_h(CTX, char *name, int limit) {
   memset(s, 0, sizeof(sym_t));
   s->desc = VAL_NON;
   s->name = strdup(name);
+  s->row = -1;
   shput(sl[ss[start]], name, s);
   aput(C.syms, s);
   return s;
@@ -1525,6 +1545,9 @@ static sym_t *nrm_sget_h(CTX, char *name, int limit) {
   } else if (limit == SCP_LOCAL) {
     start = alen(ss)-1;
     end = 1;
+  } else if (limit == SCP_CUR) {
+    start = alen(ss)-1;
+    end = start;
   } else {
     start = 0;
     end = 1;
@@ -1578,7 +1601,7 @@ static U32 nrm_orgpc(CTX) {
 static void nrm_add_rout(CTX, char *name) {
   char tmp[32];
   if (!name) {
-    snprintf(tmp, 32, "%d", nrm_orgpc(this));
+    snprintf(tmp, 32, "ROUT|%d", nrm_orgpc(this));
     name = tmp;
   }
   aput(C.routs, strdup(name));
@@ -1600,6 +1623,9 @@ void nrm_init(CTX, nrm_opt_t *opt) {
     nrm_name_reg(this, rn->key, rn->value);
   }
 }
+
+
+#define NRM_ROW flm_row(&C.flm)
 
 static nrm_t *new_nrm(nrm_opt_t *opt) {
   nrm_t *this = malloc(sizeof(nrm_t));
@@ -1864,10 +1890,13 @@ void nrm_skip_line(CTX) {
   if (nx == '\n') rd();
 }
 
-static void nrm_set_label(CTX, char *l, U32 pc) {
-  sym_t *s = nrm_sref(this,l);
+static void nrm_set_label(CTX, char *name, U32 pc) {
+  int lim = SCP_GLOBAL;
+  if (isdigit(*name)) lim = SCP_CUR;
+  sym_t *s = nrm_sref_h(this, name, lim);
   s->desc = VAL_LBL;
   s->v.w = pc;
+  s->row = this->row;
 }
 
 
@@ -2818,6 +2847,7 @@ static uint8_t *nrm_do(CTX) { //process entire S file
   C.org = AIF_ORG + AIF_HDR_SZ;
   while (!ISFLE(nx)) {
     this->pc = alen(this->out);
+    this->row = NRM_ROW;
     nrm_do_expr(this);
     if (nx == '\n') rd();
   }
