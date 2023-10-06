@@ -672,12 +672,16 @@ typedef union { //note that ARM word is 32bit, compared to x86's 16bit
   void *v;
 } val_t;
 
-typedef struct {
+struct sym_t;
+typedef struct sym_t sym_t;
+
+struct sym_t {
   char *name; //index inside the name table
   U32 desc; //description of the symbol
   val_t v; //value of the symbol
   int row;
-} sym_t;
+  sym_t *next; //allows several symbols to share a name inside a scope
+};
 
 typedef struct { char *key; sym_t *value; } *scope_t;
 
@@ -1486,37 +1490,52 @@ static int nrm_dump_aif(char *filename, uint8_t *r, uint32_t len) {
 #define SCP_ALL    0
 #define SCP_GLOBAL 1
 #define SCP_LOCAL  2
-#define SCP_CUR    3
+#define SCP_THIS   3
+
+
+
+#define SCP_LINK   0x100
+
+#define SCP_THIS_MACRO 0x200
+#define SCP_FWD        0x400
+#define SCP_BWD        0x800
 
 static sym_t *nrm_sref_h(CTX, char *name, int limit) {
   int *ss = C.ss;
   scope_t *sl = C.sl;
   int start, end;
-  if (!limit) {
+  int l = limit&0x3;
+  if (l == SCP_ALL) {
     start = alen(ss)-1;
     end = 0;
-  } else if (limit == SCP_GLOBAL) {
+  } else if (l == SCP_GLOBAL) {
     start = 0;
     end = 0;
-  } else if (limit == SCP_LOCAL) {
+  } else if (l == SCP_LOCAL) {
     start = alen(ss)-1;
     end = 1;
-  } else if (limit == SCP_CUR) {
+  } else if (l == SCP_THIS) {
     start = alen(ss)-1;
     end = start;
   } else {
     start = 0;
     end = 1;
   }
+  sym_t *next = 0;
   for (int i = start; i >= end; i--) {
     sym_t *s = shget(sl[ss[i]], name);
-    if (s) return s;
+    if (s) {
+      if (!(limit & SCP_LINK)) return s;
+      next = s;
+      break;
+    }
   }
   sym_t *s = malloc(sizeof(sym_t));
   memset(s, 0, sizeof(sym_t));
   s->desc = VAL_NON;
   s->name = strdup(name);
   s->row = -1;
+  s->next = next;
   shput(sl[ss[start]], name, s);
   aput(C.syms, s);
   return s;
@@ -1536,16 +1555,17 @@ static sym_t *nrm_sget_h(CTX, char *name, int limit) {
   int *ss = C.ss;
   scope_t *sl = C.sl;
   int start, end;
-  if (!limit) {
+  int l = limit&0x3;
+  if (l == SCP_ALL) {
     start = alen(ss)-1;
     end = 0;
-  } else if (limit == SCP_GLOBAL) {
+  } else if (l == SCP_GLOBAL) {
     start = 1;
     end = 0;
-  } else if (limit == SCP_LOCAL) {
+  } else if (l == SCP_LOCAL) {
     start = alen(ss)-1;
     end = 1;
-  } else if (limit == SCP_CUR) {
+  } else if (l == SCP_THIS) {
     start = alen(ss)-1;
     end = start;
   } else {
@@ -1892,7 +1912,7 @@ void nrm_skip_line(CTX) {
 
 static void nrm_set_label(CTX, char *name, U32 pc) {
   int lim = SCP_GLOBAL;
-  if (isdigit(*name)) lim = SCP_CUR;
+  if (isdigit(*name)) lim = SCP_THIS|SCP_LINK;
   sym_t *s = nrm_sref_h(this, name, lim);
   s->desc = VAL_LBL;
   s->v.w = pc;
@@ -2424,8 +2444,23 @@ typedef struct {
 } args_info_t;
 
 
+static int nrm_delay(CTX, args_info_t *ai) {
+  dld_t dld;
+  FLLOC(row,col,name,cflp_saved());
+  dld.row = row; dld.col = col; dld.name = strdup(name);
+  dld.pc = alen(C.out);
+  nrm_skip_line(this); //ignored for now
+  *cflp->shd = 0;
+  cflp->shd = 0;
+  dld.expr = strdup(ai->shd);
+  aput(C.dld,dld);
+  nrm_outw(this, 0);
+  return -1;
+}
+
 static int nrm_parse_arg(CTX, LHPI, U32 dsc, args_info_t *ai) {
   U32 cls = NRM_CLS(dsc);
+  sym_t *sym;
   int c;
   int n = ai->n;
   nrm_arg_t *a = &ai->as[n];
@@ -2435,7 +2470,7 @@ arg_retry:
     int shtype;
     RDS(a->s,issymchr);
     //a->v.s
-    sym_t *sym = nrm_sget(a->s);
+    sym = nrm_sget(a->s);
 
     if (sym) {
       if (sym->desc == VAL_REG) {
@@ -2494,21 +2529,8 @@ arg_retry:
         fatal("operand %d is invalid", n);
       }
     } else {
-      if (C.pass == 0) {
-        dld_t dld;
-        FLLOC(row,col,name,cflp_saved());
-        dld.row = row; dld.col = col; dld.name = strdup(name);
-        dld.pc = alen(C.out);
-        nrm_skip_line(this); //ignored for now
-        *cflp->shd = 0;
-        cflp->shd = 0;
-        dld.expr = strdup(ai->shd);
-        aput(C.dld,dld);
-        nrm_outw(this, 0);
-        return -1;
-      } else {
-        fatal("symbol `%s` is undefined", a->s);
-      }
+      if (C.pass == 0) return nrm_delay(this, ai);
+      else fatal("symbol `%s` is undefined", a->s);
     }
   } else if (c == '#') {
     int base = 10;
@@ -2564,6 +2586,38 @@ read_hex_imm:
     rd();
     ai->nr = n;
     n--;
+  } else if (c == '%') {
+    int c;
+    int dir = SCP_FWD|SCP_BWD;
+    int lim = SCP_ALL;
+    rd();
+local_again:
+    c = toupper(nx);
+    if (c == 'B') {
+      rd();
+      dir = SCP_BWD;
+      goto local_again;
+    } else if (c == 'F') {
+      rd();
+      dir = SCP_FWD;
+      goto local_again;
+    } else if (c == 'T') {
+      rd();
+      lim = SCP_THIS_MACRO;
+      goto local_again;
+    } else if (c == 'A') {
+      rd();
+      lim = SCP_ALL;
+      goto local_again;
+    } else if (!isdigit(c)) {
+      fatal("bad label");
+    }
+    char *l, *rout;
+    RDS(l,isdigit);
+    RDS(rout,issymchr);
+    if (!rout) fatal("implement ROUT name checks.", l);
+    sym = nrm_sget_h(this, l, lim); 
+    fatal("implement `%s` reading.", l);
   } else if (c == '!') {
     if (cls != NRM_CLS_STLDI && cls != NRM_CLS_STLDM)
       fatal("unexpected `%c`",c);
