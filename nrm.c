@@ -648,6 +648,8 @@ struct flmp_t {
 #define VAL_ARITH    0x07
 #define VAL_STRING   0x08
 
+#define VAL_SCPNFO   0x09
+
 
 //ObjAsm apparently uses AREA as a synonym for namespace
 typedef struct {
@@ -655,6 +657,11 @@ typedef struct {
 
 } area_t;
 
+typedef struct { //scope info
+  int up;
+  int id;
+  int lv;
+} scpnfo_t;
 
 typedef union { //note that ARM word is 32bit, compared to x86's 16bit
   int i;
@@ -670,6 +677,7 @@ typedef union { //note that ARM word is 32bit, compared to x86's 16bit
   S64 sq; //qword
   char *s;
   void *v;
+  scpnfo_t si;
 } val_t;
 
 struct sym_t;
@@ -1143,7 +1151,7 @@ typedef struct { //represents expression delayed for the 2nd pass
 struct nrm_t { // NRM's state
   flm_t flm;       //file manager
   nrm_opt_t opt;   //user specified options
-  int *ss;          //scopes stack
+  int sci;         //current scope id
   scope_t *sl;     //scopes list (all scopes)
   sym_t **syms;    //symbol list (all symbols)
   char **routs;    //ROUT area names
@@ -1486,13 +1494,24 @@ static int nrm_dump_aif(char *filename, uint8_t *r, uint32_t len) {
 
 ////////////////////////////// NRM SYMBOL //////////////////////////////////////
 
+
+///////////////////
 //scope limit
-#define SCP_ALL    0
-#define SCP_GLOBAL 1
-#define SCP_LOCAL  2
-#define SCP_THIS   3
 
-
+//search globally and locally
+#define SCP_ALL    0x0
+//search globally
+#define SCP_GBL    0x1
+//search locally
+#define SCP_LCL    0x2
+//search on the current level
+#define SCP_THIS   0x3
+//add globally
+#define ADD_GBL    (SCP_GBL<<2)
+//add locally
+#define ADD_LCL    (SCP_LCL<<2)
+//add on the current level
+#define ADD_THIS   (SCP_THIS<<2)
 
 #define SCP_LINK   0x100
 
@@ -1500,88 +1519,99 @@ static int nrm_dump_aif(char *filename, uint8_t *r, uint32_t len) {
 #define SCP_FWD        0x400
 #define SCP_BWD        0x800
 
-static sym_t *nrm_sref_h(CTX, char *name, int limit) {
-  int *ss = C.ss;
-  scope_t *sl = C.sl;
-  int start, end;
-  int l = limit&0x3;
-  if (l == SCP_ALL) {
-    start = alen(ss)-1;
-    end = 0;
-  } else if (l == SCP_GLOBAL) {
-    start = 0;
-    end = 0;
-  } else if (l == SCP_LOCAL) {
-    start = alen(ss)-1;
-    end = 1;
-  } else if (l == SCP_THIS) {
-    start = alen(ss)-1;
-    end = start;
-  } else {
-    start = 0;
-    end = 1;
-  }
-  sym_t *next = 0;
-  for (int i = start; i >= end; i--) {
-    sym_t *s = shget(sl[ss[i]], name);
-    if (s) {
-      if (!(limit & SCP_LINK)) return s;
-      next = s;
-      break;
-    }
-  }
+
+static sym_t *nrm_new_sym(CTX, int type, scope_t *scp, char *name, sym_t *next) {
   sym_t *s = malloc(sizeof(sym_t));
   memset(s, 0, sizeof(sym_t));
   s->desc = VAL_NON;
   s->name = strdup(name);
   s->row = -1;
   s->next = next;
-  shput(sl[ss[start]], name, s);
   aput(C.syms, s);
+  if (scp) shput(*scp, name, s);
   return s;
 }
 
-static sym_t *nrm_sref(CTX, char *name) {
-  return nrm_sref_h(this, name, SCP_ALL);
+
+static int nrm_scp_up(CTX, int sci) {
+  return shget(this->sl[sci], "NRM|SI")->v.si.up;
 }
 
+static int nrm_scp_lv(CTX, int sci) {
+  return shget(this->sl[sci], "NRM|SI")->v.si.lv;
+}
+
+static sym_t *nrm_sref_h(CTX, char *name, int opt) {
+  int lv = nrm_scp_lv(this, C.sci);
+
+  scope_t *sl = C.sl;
+  int start, end;
+  switch(opt&0x3) { //scope limit
+  case SCP_ALL : start = lv; end = 0;     break;
+  case SCP_GBL : start =  0; end = 0;     break;
+  case SCP_LCL : start = lv; end = 1;     break;
+  case SCP_THIS: start = lv; end = start; break;
+  }
+  int sci = C.sci;
+  sym_t *next = 0;
+  for (; lv > start; lv--) sci = nrm_scp_up(this, sci);
+  for (; lv >= end; lv--) {
+    scope_t scp = sl[sci];
+    sym_t *s = shget(scp, name);
+    if (s) {
+      if (opt & SCP_LINK) {
+        next = s;
+        break;
+      }
+      return s;
+    }
+    if ((opt&SCP_THIS_MACRO) && shget(scp, "NRM|MACRO")) break;
+    sci = nrm_scp_up(this, sci);
+  }
+  int add = opt & 0xC;
+  if (!add) return 0;
+  sym_t *s = 0;
+  if (next) s = nrm_new_sym(this, VAL_NON, &sl[sci], name, next);
+  else if (add == ADD_GBL) s = nrm_new_sym(this, VAL_NON, &sl[0], name, 0);
+  else s = nrm_new_sym(this, VAL_NON, &sl[C.sci], name, 0);
+  return s;
+}
+
+#define nrm_sref(name,opt) nrm_sref_h(this, name, opt)
+
 static sym_t *nrm_gbl_ref(CTX, char *name, int desc) {
-  sym_t *s = nrm_sref_h(this, name, SCP_GLOBAL);
+  sym_t *s = nrm_sref(name, SCP_GBL|ADD_GBL);
   s->desc = desc;
   return s;
 }
 
-static sym_t *nrm_sget_h(CTX, char *name, int limit) {
-  int *ss = C.ss;
-  scope_t *sl = C.sl;
-  int start, end;
-  int l = limit&0x3;
-  if (l == SCP_ALL) {
-    start = alen(ss)-1;
-    end = 0;
-  } else if (l == SCP_GLOBAL) {
-    start = 1;
-    end = 0;
-  } else if (l == SCP_LOCAL) {
-    start = alen(ss)-1;
-    end = 1;
-  } else if (l == SCP_THIS) {
-    start = alen(ss)-1;
-    end = start;
-  } else {
-    start = 0;
-    end = 1;
-  }
-  
-  for (int i = start; i >= end; i--) {
-    sym_t *s = shget(sl[ss[i]], name);
-    if (s) return s;
-  }
-  return 0;
+
+//assign's name to a register indexed by index
+static void nrm_name_reg(CTX, char *name, int index) {
+  sym_t *s = nrm_sref(name, SCP_GBL|ADD_GBL);
+  s->desc = VAL_REG;
+  s->v.w = index;
 }
 
 
-#define nrm_sget(name) nrm_sget_h(this, (name), SCP_ALL) 
+static void nrm_open_scope(CTX) {
+  int lv, up = C.sci, id = alen(C.sl);
+  if (up == -1) lv = 0;
+  else lv = shget(this->sl[up], "NRM|SI")->v.si.lv + 1;
+
+  scope_t scp = 0;
+  sh_new_arena(scp);
+  sym_t *s = nrm_new_sym(this, VAL_SCPNFO, &scp, "NRM|SI", 0);
+  s->v.si.up = up;
+  s->v.si.id = id;
+  s->v.si.lv = lv;
+  aput(C.sl, scp);
+  C.sci = id;
+}
+
+static void nrm_close_scope(CTX) {
+  C.sci = nrm_scp_up(this, C.sci);
+}
 
 
 ////////////////////////////// NRM INIT ////////////////////////////////////////
@@ -1592,27 +1622,7 @@ void nrm_opt_init(nrm_opt_t *o) {
 }
 
 
-//assign's name to a register indexed by index
-static void nrm_name_reg(CTX, char *name, int index) {
-  sym_t *s = nrm_sref(this,name);
-  s->desc = VAL_REG;
-  s->v.w = index;
-}
 
-static void nrm_open_scope(CTX) {
-  int id = alen(C.sl);
-  scope_t s = 0;
-  sh_new_arena(s);
-  aput(C.sl, s);
-  aput(C.ss, id);
-  sym_t *sym = nrm_sref_h(this, "NRM|UP", SCP_LOCAL);
-  sym->desc = VAL_ARITH;
-  sym->v.w = id;
-}
-
-static void nrm_close_scope(CTX) {
-  apop(C.ss);
-}
 
 static U32 nrm_orgpc(CTX) {
   return C.pc + C.org;
@@ -1632,6 +1642,8 @@ void nrm_init(CTX, nrm_opt_t *opt) {
   if (!nrm_globals_ready) nrm_init_globals();
 
   memset(this, 0, sizeof(nrm_t));
+  
+  this->sci = -1;
 
   if (opt) memcpy(&C.opt, opt, sizeof(nrm_opt_t));
   else nrm_opt_init(&C.opt);
@@ -1659,7 +1671,6 @@ static void del_nrm(CTX) {
   for (i = 0; i < alen(C.whlstk); i++) arrfree(C.whlstk[i]);
   for (i = 0; i < alen(C.sl); i++) shfree(C.sl[i]);
   arrfree(C.sl);
-  arrfree(C.ss);
   arrfree(C.whlstk);
   flm_deinit(&this->flm);
   free(this);
@@ -1911,9 +1922,9 @@ void nrm_skip_line(CTX) {
 }
 
 static void nrm_set_label(CTX, char *name, U32 pc) {
-  int lim = SCP_GLOBAL;
-  if (isdigit(*name)) lim = SCP_THIS|SCP_LINK;
-  sym_t *s = nrm_sref_h(this, name, lim);
+  int lim = ADD_GBL;
+  if (isdigit(*name)) lim = SCP_THIS|ADD_LCL|SCP_LINK;
+  sym_t *s = nrm_sref(name, lim);
   s->desc = VAL_LBL;
   s->v.w = pc;
   s->row = this->row;
@@ -1960,7 +1971,7 @@ arg_retry:
     int shtype;
     char *s;
     RDS(s,issymchr);
-    sym_t *sym = nrm_sget(s);
+    sym_t *sym = nrm_sref(s,0);
     if (sym) {
       if (sym->desc == VAL_EQU) {
         flm_include(&this->flm, "<EQU>", s, strlen(s), 0);
@@ -2217,7 +2228,7 @@ static char *nrm_read_macro(CTX) {
   aput(v,as);
   aput(v,vs);
   aput(v,body);
-  sym_t *s = nrm_sref(this, m);
+  sym_t *s = nrm_sref(m, SCP_GBL|ADD_GBL);
   s->desc = VAL_MACRO;
   s->v.v = v;
 }
@@ -2236,7 +2247,7 @@ static char *nrm_read_subst_line(CTX, LHPI) {
     if (escape&1) { LHPUT(c); continue;} //dont expand $ inside |symbols|
     RDS(n, issymchr);
     if (nx == '.') rd(); //special char terminating a macro variable reference
-    sym_t *s = nrm_sget(n);
+    sym_t *s = nrm_sref(n,0);
     if (!s) fatal("reference to undeclared variable `$%s`", n);
     char *v = s->v.s;
     LHPTR = n;
@@ -2277,9 +2288,10 @@ static void nrm_do_macro(CTX, char *m, char *l, sym_t *s) {
   nrm_skip_line(this);
 
   nrm_open_scope(this);
-  
+  nrm_sref("NRM|MACRO", SCP_THIS|ADD_LCL);
+
   for (int i = 0; i < alen(as); i++) { //add arguments to the scope
-    sym_t *s = nrm_sref_h(this, as[i], SCP_LOCAL);
+    sym_t *s = nrm_sref(as[i], SCP_THIS|ADD_LCL);
     s->desc = VAL_STRING;
     s->v.s = strdup(vs[i]);
   }
@@ -2293,7 +2305,7 @@ static void nrm_do_dct(CTX, LHPI, char *m, char *l) { //handles directives
   sym_t r;
   int dct = shget(dctm, m);
   if (!dct) {
-    sym_t *sym = nrm_sget(m);
+    sym_t *sym = nrm_sref(m,0);
     if (sym && sym->desc == VAL_MACRO) {
       nrm_do_macro(this, m, l, sym);
       return;
@@ -2310,7 +2322,7 @@ static void nrm_do_dct(CTX, LHPI, char *m, char *l) { //handles directives
     char *v;
     RDS(v,!ISNLC);
     if (nx == '\n') rd();
-    sym_t *s = nrm_sref(this,l);
+    sym_t *s = nrm_sref(l,ADD_GBL);
     s->desc = VAL_EQU;
     s->v.s = strdup(v);
     *l = 0; //consume label
@@ -2470,7 +2482,7 @@ arg_retry:
     int shtype;
     RDS(a->s,issymchr);
     //a->v.s
-    sym = nrm_sget(a->s);
+    sym = nrm_sref(a->s,0);
 
     if (sym) {
       if (sym->desc == VAL_REG) {
@@ -2520,7 +2532,7 @@ arg_retry:
         a->v.w = (v<<7) | (shtype<<5);
       } else if (isalpha(c)) {
         RDS(a->s,issymchr);
-        sym_t *sym = nrm_sget(a->s);
+        sym_t *sym = nrm_sref(a->s,0);
         if (!sym || sym->desc != VAL_REG) {
            fatal("`%s` is unexpected", a->s);
         }
@@ -2589,7 +2601,7 @@ read_hex_imm:
   } else if (c == '%') {
     int c;
     int dir = SCP_FWD|SCP_BWD;
-    int lim = SCP_ALL;
+    int lim = SCP_GBL;
     rd();
 local_again:
     c = toupper(nx);
@@ -2607,7 +2619,7 @@ local_again:
       goto local_again;
     } else if (c == 'A') {
       rd();
-      lim = SCP_ALL;
+      lim = SCP_GBL;
       goto local_again;
     } else if (!isdigit(c)) {
       fatal("bad label");
@@ -2616,7 +2628,7 @@ local_again:
     RDS(l,isdigit);
     RDS(rout,issymchr);
     if (!rout) fatal("implement ROUT name checks.", l);
-    sym = nrm_sget_h(this, l, lim); 
+    sym = nrm_sref(l, lim); 
     fatal("implement `%s` reading.", l);
   } else if (c == '!') {
     if (cls != NRM_CLS_STLDI && cls != NRM_CLS_STLDM)
@@ -2635,7 +2647,7 @@ local_again:
       int c = nx;
       if (isalpha(c)) {
         RDS(a->s,issymchr);
-        sym_t *sym = nrm_sget(a->s);
+        sym_t *sym = nrm_sref(a->s,0);
         if (!sym || sym->desc != VAL_REG) fatal("`%s` is unexpected", a->s);
         if (interp) {
           interp = 0;
