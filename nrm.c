@@ -1563,6 +1563,21 @@ static sym_t *nrm_sref_h(CTX, char *name, int opt) {
         next = s;
         break;
       }
+      if (s->next) {
+        sym_t *r = 0;
+        for (; s; s = s->next) {
+          if (opt & SCP_FWD) {
+            if (s->v.w >= C.pc && (!r || r->v.w > s->v.w)) r = s;
+          } else if (opt & SCP_BWD) {
+            if (s->v.w <= C.pc && (!r || r->v.w < s->v.w)) r = s;
+          } else {
+            if (!r ||   abs(-(int)r->v.w - (int)C.pc)
+                      < abs(-(int)s->v.w - (int)C.pc))
+              r = s;
+          }
+        }
+        s = r;
+      }
       return s;
     }
     if ((opt&SCP_THIS_MACRO) && shget(scp, "NRM|MACRO")) break;
@@ -1729,7 +1744,7 @@ static char *get_hex(CTX) {
 #define NRM_ARG_ADR  4
 #define NRM_ARG_SFT  5
 //register set
-#define NRM_ARG_RES  6
+#define NRM_ARG_RST  6
 
 #define NRM_SFT_REG  (1<<4)
 
@@ -1753,7 +1768,7 @@ static int issymchr(int c) {
   if (nx == '-') {sign=1; rd();}                            \
   if (base==10) RDS(tmp_,isdigit); else RDS(tmp_,isxdigit); \
   if (!tmp_[0]) fatal("number expected");                   \
-  name = strtol(tmp_, 0, base);                         \
+  name = strtol(tmp_, 0, base);                             \
   if (sign) name = -name;}
 
 
@@ -2681,7 +2696,7 @@ local_again:
       rd();
       regs |= NRM_LOAD_PSR_FORCE_USER_MODE;
     }
-    a->desc = NRM_ARG_RES;
+    a->desc = NRM_ARG_RST;
     a->v.w = regs;
   } else {
     fatal("operand %d is invalid", n);
@@ -2834,7 +2849,7 @@ static U32 nrm_process_args(CTX, U32 dsc, char *m, args_info_t *ai) {
     if (as[0].desc == NRM_ARG_REG) dsc |= as[0].v.w<<16; //base register
     else fatal("base register is invalid");
 
-    if (as[1].desc == NRM_ARG_RES) dsc |= as[1].v.w; //base register
+    if (as[1].desc == NRM_ARG_RST) dsc |= as[1].v.w; //base register
     else fatal("register set is invalid");
 
     break;
