@@ -1,0 +1,119 @@
+<Operation>{<cond>}{S} Rd, Rm, Rn
+
+Data processing instruction format:
+BitOffset/NBits: Name - Description
+28/ 4: F  - if condition: see CND_* macros
+25/ 3: C  - class: 0 = Rm is register
+                   1 = Rm is immeidate
+21/ 4: O  - operation code: see NRM_* macros
+20/ 1: S  - set flags
+16/ 4: Rn - 1st operand register
+12/ 4: Rd - destination register
+ 0/12: Rm - 2nd operand register or immediate
+            Register (C=0):
+              0/4: Register
+              4/1: ShiftSource
+              5/2: ShiftType
+                0 = LSL logical left
+                1 = LSR logical right
+                2 = ASR arithmetic right (sign bit handled)
+                3 = ROR rotate right
+              7/5: shift value
+                Immediate (ShiftSource=0)
+                  7/5 = immediate (0 to 31, i.e. 7 for LSL#7)
+                Register (ShiftSource=1)
+                  7/1 = should be 0 (1 switches to different instruction set)
+                  8/4 = register
+            Immediate (C=1):
+              0/8: value
+              8/4: rotate right amount
+                   note: it is multiplied by 2
+                   before use
+
+RRX is a shorthand for `Operation RegA, RegB, ROR #0`
+
+In 24-bit mode postfixing CMP/CMN/TST/TEQ with P sets Rd to 0xF = PSR
+R15, beside PC, used to hold PSR, which later became CPSR.
+
+
+LDR/STR with immediate offset:
+  Pre-indexed instruction (possibly with write back)
+    opcode{cond}{B} register,[base{index}]{!}
+  Post-indexed instruction
+    opcode{cond}{B}{T} register,[base]{,index}
+  {T} if present the TRANS pin will be active.
+      Used in supervisor mode to with user mode page translation.
+      I.e. when doing unchecked and untranslated writes
+      to a user supplied address.
+      Note that T is invalid for preindexed addressing
+
+28/ 4: F  - if {cond}: see CND_.* macros
+25/ 3: C  - class: 2 = Rm is immediate
+                   3 = Rm is register
+24/ 1: P  - pre/post increment: 0 = post: add offset after transfer
+                                1 = pre: add offset before transfer
+23/ 1: U  - up/down: 0 = down: subtract offset from base
+                     1 = up: add offset to base
+22/ 1: B  - BYTE/WORD bit
+21/ 1: W  - Write-back {!}:write new address into base register
+            W=1 && P=0: LDRT/STRT operation (forced usermode MMU translation)
+            W=1 && P=1: writeback without forced MMU translation
+            P=0 && W=0: writeback without forced MMU translation
+            P=1 && W=0: no writeback, no forced MMU translation
+            load/store register with MMU translation
+20/ 1: D  - direction: 0=STR, 1=LDR
+16/ 4: Rn - base register
+12/ 4: Rd - src/dst register
+0 /12: Rm - offset
+       Register (C=2), same format as with data processing opcodes
+        0/4: Register
+        4/1: ShiftSource
+        5/2: ShiftType
+          0 = LSL logical left
+          1 = LSR logical right
+          2 = ASR arithmetic right (sign bit handled)
+          3 = ROR rotate right
+        7/5: shift value
+          Immediate (ShiftSource=0)
+            7/5 = immediate (0 to 31, i.e. 7 for LSL#7)
+          Register (ShiftSource=1)
+            7/1 = should be 0 (1 turns it into an undefined opcode)
+            8/4 = register
+       Immediate (C=3)
+         0/12: 12-bit immediate offset applied to base
+
+Undefine opcode space (intended for VM or coprocessor use):
+28/ 4: F  - if {cond}: see CND_.* macros
+25/ 3: C  - class: 3
+7 / 1: U  - signifies undefined opcode. All other bits are free to use
+
+LDM/STM instruction format:
+opcode{cond}type base{!}, {list}{^}
+For example, STMNEDB
+28/ 4: F  - if {cond}: see CND_.* macros
+25/ 3: C  - class: always 4
+24/ 1: P  - pre/post increment: 0 = post: add offset after transfer
+                                1 = pre: add offset before transfer
+23/ 1: U  - up/down: 0 = subtract offset from base
+                     1 = add offset to base
+22/ 1: S  - {^} = load PSR or force user mode
+21/ 1: W  - Write-back {!}: write new address into base register
+20/ 1: D  - direction: 0=STM, 1=LDM
+16/ 4: Rn - base register
+ 0/15: Rs - registers to load store (i.e. the {list}).
+
+
+B/BL branch instruction format:
+28/ 4: F  - if condition: see CND_.* macros
+25/ 3: C  - class: always 5
+24/ 1: L  - Link: 0 = B, 1 = BL
+ 0/24: Im - Immediate Offset
+
+
+Coprocessor/SWI instruction format:
+28/ 4: F  - if condition: see CND_.* macros
+25/ 3: C  - class: always 7
+24/ 1: S  - 0=coprocessro, 1=SWI
+0 /24: Op - Operation
+       Immediate SWI number (S=1)
+       Coprocessor operation (S=0)
