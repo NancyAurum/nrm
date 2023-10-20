@@ -2372,7 +2372,7 @@ arg_retry:
     RDS(a->s,issymchr);
     //a->v.s
     sym = nrm_sref(a->s,0);
-
+handle_sym:
     if (sym) {
       if (sym->desc == VAL_REG) {
         a->desc = NRM_ARG_REG;
@@ -2431,7 +2431,7 @@ arg_retry:
       }
     } else {
       if (C.pass == 0) return nrm_delay(this, ai);
-      else fatal("symbol `%s` is undefined", a->s);
+      fatal("symbol `%s` is undefined", a->s);
     }
   } else if (c == '#') {
     int base = 10;
@@ -2516,9 +2516,11 @@ local_again:
     char *l, *rout;
     RDS(l,isdigit);
     RDS(rout,issymchr);
-    if (!rout) fatal("implement ROUT name checks.", l);
+    if (*rout) fatal("implement ROUT name checks.", l);
     sym = nrm_sref(l, lim); 
-    fatal("implement `%s` reading.", l);
+    if (sym) goto handle_sym;
+    if (C.pass == 0) return nrm_delay(this, ai);
+    fatal("symbol `%s` is undefined", a->s);
   } else if (c == '!') {
     if (cls != NRM_CLS_STLDI && cls != NRM_CLS_STLDM)
       fatal("unexpected `%c`",c);
