@@ -563,6 +563,7 @@ struct sym_t {
   val_t v; //value of the symbol
   int row;
   sym_t *next; //allows several symbols to share a name inside a scope
+  int rout; //rout this symbol belongs to
 };
 
 typedef struct { char *key; sym_t *value; } *scope_t;
@@ -1401,6 +1402,7 @@ static sym_t *nrm_new_sym(CTX, int type, scope_t *scp, char *name, sym_t *next) 
   s->name = strdup(name);
   s->row = -1;
   s->next = next;
+  s->rout = alen(C.routs);
   aput(C.syms, s);
   if (scp) shput(*scp, name, s);
   return s;
@@ -1527,6 +1529,7 @@ static void nrm_add_rout(CTX, char *name) {
 }
 
 
+
 void nrm_init(CTX, nrm_opt_t *opt) {
   if (!nrm_globals_ready) nrm_init_globals();
 
@@ -1539,6 +1542,7 @@ void nrm_init(CTX, nrm_opt_t *opt) {
 
   nrm_open_scope(this);
   flm_init(&this->flm, this);
+  nrm_add_rout(this, "<root>");
 
   for (ki_t *rn = base_regs; rn->key; rn++) {
     nrm_name_reg(this, rn->key, rn->value);
@@ -2372,8 +2376,8 @@ arg_retry:
     RDS(a->s,issymchr);
     //a->v.s
     sym = nrm_sref(a->s,0);
-handle_sym:
     if (sym) {
+handle_sym:
       if (sym->desc == VAL_REG) {
         a->desc = NRM_ARG_REG;
         a->v.w = sym->v.w;
